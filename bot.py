@@ -502,65 +502,128 @@ def save_state(state):
 class SingleWatcher:
     def __init__(self):
         self.active = False
-        self.username = None
-        self.channel_id = None
-        self.livestream_id = None
-        self.stop_event = threading.Event()
-        self.watch_thread = None
+        self.watchers = {}
+        self._lock = threading.Lock()
         self.started_at = None
+
+    def start(self, chat_id, usernames):
+        """Start watching multiple streamers simultaneously"""
+        if isinstance(usernames, str):
+            usernames = [usernames]
+
+        started = []
+        failed = []
+        for username in usernames:
+            username = username.strip("@").strip()
+            if not username: continue
+            if username in self.watchers:
+                failed.append(f"@{username} (already watching)")
+                continue
+            info = get_channel_info(username)
+            if not info:
+                failed.append(f"@{username} (not found)")
+                continue
+            if not info.get("is_live"):
+                failed.append(f"@{username} (offline)")
+                continue
+            watcher = SingleStreamWatcher(username, info["channel_id"], info.get("livestream_id"), self)
+            with self._lock:
+                self.watchers[username] = watcher
+                self.active = True
+                if not self.started_at:
+                    self.started_at = datetime.now()
+            follow_channel(info["channel_id"])
+            threading.Thread(target=watcher.run, args=(chat_id,), daemon=True).start()
+            started.append(f"@{username}")
+            log(f"[WATCH] Started @{username}")
+            time.sleep(0.3)
+
+        if not started:
+            return False, "No streamers started.\n" + "\n".join(failed)
+
+        msg = f"<b>WATCHING {len(started)} STREAMERS!</b>\n\n"
+        msg += "\n".join(started)
+        if failed:
+            msg += "\n\n<b>Failed:</b>\n" + "\n".join(failed)
+        msg += "\n\n/watchstop to stop all"
+        return True, msg
+
+    def stop(self, reason="manual"):
+        if not self.watchers:
+            return False, "Not watching."
+        with self._lock:
+            usernames = list(self.watchers.keys())
+            total_events = sum(w.events_sent for w in self.watchers.values())
+            total_time = sum(w.watch_time for w in self.watchers.values())
+            total_claimed = sum(w.claimed for w in self.watchers.values())
+            for w in self.watchers.values():
+                w.stop_event.set()
+            self.watchers.clear()
+            self.active = False
+            self.started_at = None
+        elapsed = (datetime.now() - self.started_at).total_seconds() if self.started_at else 0
+        msg = (f"<b>ALL WATCHERS STOPPED!</b> ({reason})\n\n"
+                f"Streamers: {', '.join(['@'+u for u in usernames])}\n"
+                f"Total events: {total_events}\n"
+                f"Total time: {fmt_duration(total_time)}\n"
+                f"Claimed: {total_claimed}")
+        return True, msg
+
+    def get_status(self):
+        if not self.watchers:
+            return "<b>WATCHER: IDLE</b>\n\n/use /watchtest <user1> <user2>..."
+        lines = []
+        total_events = 0
+        total_time = 0
+        total_claimed = 0
+        with self._lock:
+            for username, w in self.watchers.items():
+                elapsed = (datetime.now() - w.started_at).total_seconds() if w.started_at else 0
+                lines.append(f"@{username}: {fmt_duration(elapsed)} | {w.events_sent} events | {w.claimed} claimed")
+                total_events += w.events_sent
+                total_time += w.watch_time
+                total_claimed += w.claimed
+        return (f"<b>WATCHER: ACTIVE</b> ({len(self.watchers)} streams)\n\n"
+                + "\n".join(lines) +
+                f"\n\nTotal: {fmt_duration(total_time)} | {total_events} events | {total_claimed} claimed\n"
+                f"/watchstop to stop all")
+
+    def on_watcher_done(self, username):
+        with self._lock:
+            self.watchers.pop(username, None)
+            if not self.watchers:
+                self.active = False
+        log(f"[WATCH] @{username} done")
+
+
+class SingleStreamWatcher:
+    def __init__(self, username, channel_id, livestream_id, parent):
+        self.username = username
+        self.channel_id = channel_id
+        self.livestream_id = livestream_id
+        self.parent = parent
+        self.stop_event = threading.Event()
+        self.started_at = datetime.now()
         self.watch_time = 0
         self.events_sent = 0
         self.claimed = 0
         self._lock = threading.Lock()
 
-    def start(self, chat_id, username):
-        if self.active: return False, f"Already watching @{self.username}! /watchstop first."
-        info = get_channel_info(username)
-        if not info: return False, f"@{username} not found."
-        if not info.get("is_live"): return False, f"@{username} is OFFLINE."
-        self.active = True
-        self.username = username
-        self.channel_id = info["channel_id"]
-        self.livestream_id = info.get("livestream_id")
-        self.stop_event.clear()
-        self.started_at = datetime.now()
-        self.watch_time = 0
-        self.events_sent = 0
-        self.claimed = 0
-        follow_channel(self.channel_id)
-        self.watch_thread = threading.Thread(target=self._run, args=(chat_id,), daemon=True)
-        self.watch_thread.start()
-        return True, f"<b>WATCHING @{username}!</b>\nContinuous. /watchstop to stop."
-
-    def stop(self, reason="manual"):
-        if not self.active: return False, "Not watching."
-        self.stop_event.set()
-        self.active = False
-        elapsed = (datetime.now() - self.started_at).total_seconds() if self.started_at else 0
-        msg = f"<b>WATCH STOPPED!</b> ({reason})\nStreamer: @{self.username}\nTime: {fmt_duration(elapsed)}\nEvents: {self.events_sent}\nClaimed: {self.claimed}"
-        self.username = None
-        return True, msg
-
-    def get_status(self):
-        if not self.active: return "<b>WATCHER: IDLE</b>"
-        elapsed = (datetime.now() - self.started_at).total_seconds() if self.started_at else 0
-        return (f"<b>WATCHER: ACTIVE</b>\nStreamer: @{self.username}\nTime: {fmt_duration(elapsed)}\n"
-                f"Events: {self.events_sent}\nClaimed: {self.claimed}")
-
-    def _run(self, chat_id):
+    def run(self, chat_id):
         try:
             while not self.stop_event.is_set():
                 try: self._ws_connect(); break
                 except Exception as e:
-                    log(f"[WATCH] WS error: {e}")
+                    log(f"[WATCH] WS error @{self.username}: {e}")
                     if not self.stop_event.is_set(): time.sleep(5)
             if self.stop_event.is_set(): return
             info = get_channel_info(self.username)
             if not info or not info.get("is_live"):
-                s, m = self.stop(reason="streamer offline")
-                if s: tg_send(m, chat_id=ADMIN_ID)
+                tg_send(f"@{self.username} went offline.", chat_id=chat_id)
         except Exception as e:
-            log(f"[WATCH] Fatal: {e}")
+            log(f"[WATCH] Fatal @{self.username}: {e}")
+        finally:
+            self.parent.on_watcher_done(self.username)
 
     def _ws_connect(self):
         ws_token = get_ws_token(get_cookie())
@@ -603,7 +666,6 @@ class SingleWatcher:
                         self.events_sent += 1
                         self.watch_time += 60
                     last_ue = now
-                    # Smart claim: check every 60s, not 30s
                     if elapsed_since_start >= 60:
                         smart_claim_check(username)
                     log(f"[WATCH] event #{self.events_sent} @{username} ({fmt_duration(self.watch_time)})")
@@ -887,7 +949,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         watching = pw.state.get("watching", {})
         w_list = ", ".join([f"@{u}" for u in watching]) or "None"
         sw_s = "ACTIVE" if single_watcher.active else "IDLE"
-        sw_u = f"@{single_watcher.username}" if single_watcher.username else "None"
+        sw_users = ", ".join([f"@{u}" for u in single_watcher.watchers.keys()]) or "None"
         html = f"""<!DOCTYPE html><html><head><title>Kick Drops v15</title>
 <meta http-equiv="refresh" content="30">
 <style>body{{font-family:Arial;background:#1a1a2e;color:#eee;padding:20px}}h1{{color:#e94560}}.c{{background:#16213e;padding:20px;border-radius:10px;margin:10px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;text-align:left;border-bottom:1px solid #333}}th{{background:#0f3460}}a{{color:#e94560}}</style></head><body>
@@ -895,7 +957,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 <p><a href="/logs">View Logs</a></p>
 <div class="c"><h2>Status</h2><p>Polls: {state.get('polls',0)}</p><p>Last: {state.get('last_poll','never')}</p></div>
 <div class="c"><h2>Parallel Watcher</h2><p style='color:{pw_c};font-size:1.2em'><b>{pw_s}</b></p><p>Watching: {w_list}</p><p>Watched: {pw.state.get('total_watched',0)}</p><p>Claimed: {pw.state.get('rewards_claimed',0)}</p></div>
-<div class="c"><h2>Single Watcher</h2><p><b>{sw_s}</b></p><p>{sw_u}</p></div>
+<div class="c"><h2>Single Watcher</h2><p><b>{sw_s}</b></p><p>{sw_users}</p></div>
 <div class="c"><h2>Users ({active}/{len(subs)})</h2><table><tr><th>ID</th><th>Status</th><th>Joined</th></tr>{rows}</table></div>
 <div class="c"><h2>Drops ({len(known)})</h2><table><tr><th>Name</th><th>Status</th></tr>{drops}</table></div></body></html>"""
         self.send_response(200)
@@ -946,8 +1008,8 @@ def handle_command(cmd, chat_id, text=""):
             "/watchroundstop - Stop\n"
             "/watchroundstatus - Status\n\n"
             "<b>SINGLE WATCHER:</b>\n"
-            "/watchtest &lt;user&gt; - Watch one streamer\n"
-            "/watchstop - Stop\n"
+            "/watchtest &lt;user1&gt; [user2] - Watch specific streams\n"
+            "/watchstop - Stop all\n"
             "/watchstatus - Watch info\n\n"
             "<b>CONFIG:</b>\n"
             "/setcookie - Update cookie\n"
@@ -1044,9 +1106,11 @@ def handle_command(cmd, chat_id, text=""):
 
     elif cmd == "/watchtest":
         parts = text.split()
-        if len(parts) < 2: tg_send("Usage: /watchtest &lt;user&gt;", chat_id=chat_id); return
-        username = parts[1].strip("@")
-        success, msg = single_watcher.start(chat_id, username)
+        if len(parts) < 2:
+            tg_send("Usage: /watchtest &lt;user1&gt; [user2] [user3]...\nExample: /watchtest stake casinoen", chat_id=chat_id)
+            return
+        usernames = [p.strip("@") for p in parts[1:] if p.strip("@")]
+        success, msg = single_watcher.start(chat_id, usernames)
         tg_send(msg, chat_id=chat_id)
 
     elif cmd == "/watchstop":
