@@ -211,13 +211,29 @@ def get_channel_info(username):
     except: return None
 
 def follow_channel(channel_id):
-    """Follow a channel on Kick"""
+    """Follow a channel on Kick - POST request"""
     try:
         url = FOLLOW_API.format(channel_id=channel_id)
-        kick_request(url)
-        log(f"[FOLLOW] Followed channel {channel_id}")
+        headers = dict(BASE_HEADERS)
+        cookie = get_cookie()
+        if cookie: headers["Cookie"] = "session=" + cookie
+        headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+        headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=b"{}", method="POST")
+        for k, v in headers.items(): req.add_header(k, v)
+        resp = urllib.request.urlopen(req, timeout=10)
+        result = resp.read().decode()
+        log(f"[FOLLOW] OK channel_id={channel_id}")
         return True
-    except:
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:200] if e.fp else ""
+        if e.code == 409:
+            log(f"[FOLLOW] Already following {channel_id}")
+            return True
+        log(f"[FOLLOW] HTTP {e.code} channel_id={channel_id}: {body}")
+        return False
+    except Exception as e:
+        log(f"[FOLLOW] Error channel_id={channel_id}: {e}")
         return False
 
 def get_followed_streamers():
