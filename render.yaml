@@ -10,3 +10,7 @@ services:
         value: "8182391939"
       - key: KICK_COOKIE
         value: "365875656%7C3qeqtSAxow2mU2adRmgluNijBSImYcgoLFRIZ2v9"
+      - key: DASH_USER
+        value: "admin"
+      - key: DASH_PASS
+        value: "kickbot2026"
