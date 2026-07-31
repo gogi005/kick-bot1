@@ -1,10 +1,10 @@
 """
-Kick Stake Drops Bot v8 (Render Ready) - with Auto-Watcher
-- No Playwright dependency
-- Cookie auto-read from file
-- Multi-user + admin alerts
+Kick Stake Drops Bot v9 (Round-Robin Auto-Watcher)
+- Cookie auto-refresh via Playwright (every 30 min)
+- Multi-user with admin alerts
+- Web dashboard
 - 24/7 polling
-- NEW: Real WebSocket-based stream auto-watcher
+- NEW: Round-robin mode - watch 5-10 min per streamer then switch
 """
 import urllib.request, json, time, os, threading, random
 import asyncio
@@ -15,20 +15,21 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ============ CONFIG ============
 TG_TOKEN = os.environ.get("TG_TOKEN", "8860462138:AAGkQQF1c-MyTfD3-3WluZNMarcT7HLj4dg")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8182391939"))
-COOKIE = os.environ.get("KICK_COOKIE", "365875656%7C3qeqtSAxow2mU2adRmgluNijBSImYcgoLFRIZ2v9")
-KICK_CLIENT_TOKEN = os.environ.get("KICK_CLIENT_TOKEN", "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823")
+INITIAL_COOKIE = os.environ.get("KICK_COOKIE", "365875656%7C3qeqtSAxow2mU2adRmgluNijBSImYcgoLFRIZ2v9")
 POLL_INTERVAL = 5
 DROPS_API = "https://web.kick.com/api/v1/drops/campaigns"
 PROGRESS_API = "https://web.kick.com/api/v1/drops/progress"
 CLAIM_API = "https://web.kick.com/api/v1/drops/claim"
 CHANNEL_API = "https://kick.com/api/v2/channels/{username}"
-LIVESTREAMS_API = "https://web.kick.com/api/v1/livestreams"
 WS_TOKEN_API = "https://websockets.kick.com/viewer/v1/token"
 WS_URL_TEMPLATE = "wss://websockets.kick.com/viewer/v1/connect?token={token}"
+KICK_CLIENT_TOKEN = os.environ.get("KICK_CLIENT_TOKEN", "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823")
 STATE_FILE = "tg_bot_state.json"
 SUBS_FILE = "tg_subscribers.json"
-WATCHER_FILE = "tg_watcher_state.json"
+COOKIE_FILE = "kick_cookie_live.json"
+RR_STATE_FILE = "tg_roundrobin_state.json"
 DASHBOARD_PORT = int(os.environ.get("PORT", "8080"))
+KEEPER_INTERVAL = 1800
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -42,6 +43,49 @@ def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
+# ---- Cookie Management ----
+def get_cookie():
+    if os.path.exists(COOKIE_FILE):
+        try:
+            with open(COOKIE_FILE) as f:
+                c = json.load(f).get("cookie", "")
+                if c: return c
+        except: pass
+    return INITIAL_COOKIE
+
+def save_cookie(cookie):
+    with open(COOKIE_FILE, "w") as f:
+        json.dump({"cookie": cookie, "time": datetime.now().isoformat()}, f)
+
+# ---- Session Keeper ----
+def session_keeper():
+    log("Session keeper started")
+    while True:
+        try:
+            from playwright.sync_api import sync_playwright
+            cookie = get_cookie()
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                ctx = browser.new_context(user_agent="Mozilla/5.0")
+                ctx.add_cookies([{"name": "session", "value": cookie, "domain": ".kick.com", "path": "/"}])
+                page = ctx.new_page()
+                for url in ["https://kick.com/", "https://kick.com/drops/all-campaigns"]:
+                    try:
+                        page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                        time.sleep(2)
+                    except: pass
+                new_cookie = None
+                for c in ctx.cookies():
+                    if c["name"] == "session":
+                        new_cookie = c["value"]; break
+                browser.close()
+                if new_cookie:
+                    save_cookie(new_cookie)
+                    log(f"Cookie refreshed ({len(new_cookie)} chars)")
+        except Exception as e:
+            log(f"Keeper error: {e}")
+        time.sleep(KEEPER_INTERVAL)
+
 # ---- Subscribers ----
 def load_subs():
     if os.path.exists(SUBS_FILE):
@@ -53,17 +97,17 @@ def load_subs():
 def save_subs(subs):
     with open(SUBS_FILE, "w") as f: json.dump(subs, f, indent=2)
 
-def add_sub(cid):
+def add_sub(chat_id):
     subs = load_subs()
-    sid = str(cid)
+    sid = str(chat_id)
     is_new = sid not in subs or not subs[sid].get("active", True)
     subs[sid] = {"added_at": datetime.now().isoformat(), "active": True}
     save_subs(subs)
     return is_new
 
-def remove_sub(cid):
+def remove_sub(chat_id):
     subs = load_subs()
-    sid = str(cid)
+    sid = str(chat_id)
     if sid in subs:
         subs[sid]["active"] = False
         save_subs(subs)
@@ -95,13 +139,11 @@ def tg_get_updates(offset=0):
 # ---- Kick API ----
 def kick_request(url, extra_headers=None, timeout=15):
     headers = dict(BASE_HEADERS)
-    if COOKIE:
-        headers["Cookie"] = "session=" + COOKIE
-    if extra_headers:
-        headers.update(extra_headers)
+    cookie = get_cookie()
+    if cookie: headers["Cookie"] = "session=" + cookie
+    if extra_headers: headers.update(extra_headers)
     req = urllib.request.Request(url)
-    for k, v in headers.items():
-        req.add_header(k, v)
+    for k, v in headers.items(): req.add_header(k, v)
     resp = urllib.request.urlopen(req, timeout=timeout)
     return json.loads(resp.read().decode())
 
@@ -113,30 +155,6 @@ def fetch_campaigns():
         if e.code in (401, 403): return None, False
         return None, True
     except: return None, True
-
-def fetch_progress():
-    try:
-        data = kick_request(PROGRESS_API, extra_headers={"Authorization": f"Bearer {COOKIE}"})
-        return data.get("data", []) if isinstance(data, dict) else data
-    except Exception as e:
-        log(f"Progress fetch error: {e}")
-        return []
-
-def claim_reward(campaign_id, reward_id):
-    try:
-        headers = dict(BASE_HEADERS)
-        headers["Cookie"] = "session=" + COOKIE
-        headers["Authorization"] = f"Bearer {COOKIE}"
-        headers["Content-Type"] = "application/json"
-        body = json.dumps({"campaign_id": campaign_id, "reward_id": reward_id}).encode()
-        req = urllib.request.Request(CLAIM_API, data=body, method="POST")
-        for k, v in headers.items():
-            req.add_header(k, v)
-        resp = urllib.request.urlopen(req, timeout=15)
-        return json.loads(resp.read().decode())
-    except Exception as e:
-        log(f"Claim error: {e}")
-        return None
 
 def get_channel_info(username):
     try:
@@ -163,6 +181,39 @@ def get_ws_token(session_token):
     except Exception as e:
         log(f"WS token error: {e}")
         return None
+
+def fetch_progress():
+    try:
+        cookie = get_cookie()
+        data = kick_request(PROGRESS_API, extra_headers={"Authorization": f"Bearer {cookie}"})
+        return data.get("data", []) if isinstance(data, dict) else data
+    except Exception as e:
+        log(f"Progress fetch error: {e}")
+        return []
+
+def claim_reward(campaign_id, reward_id):
+    try:
+        cookie = get_cookie()
+        headers = dict(BASE_HEADERS)
+        headers["Cookie"] = "session=" + cookie
+        headers["Authorization"] = f"Bearer {cookie}"
+        headers["Content-Type"] = "application/json"
+        body = json.dumps({"campaign_id": campaign_id, "reward_id": reward_id}).encode()
+        req = urllib.request.Request(CLAIM_API, data=body, method="POST")
+        for k, v in headers.items(): req.add_header(k, v)
+        resp = urllib.request.urlopen(req, timeout=15)
+        return json.loads(resp.read().decode())
+    except Exception as e:
+        log(f"Claim error: {e}")
+        return None
+
+async def send_user_event(ws, channel_id, livestream_id):
+    event = {"type": "user_event", "data": {"message": {
+        "name": "tracking.user.watch.livestream",
+        "channel_id": channel_id,
+        "livestream_id": int(livestream_id) if livestream_id else int(channel_id),
+    }}}
+    await ws.send(json.dumps(event))
 
 def is_stake_drop(c):
     connect = c.get("connect_url", "").lower()
@@ -194,74 +245,189 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w") as f: json.dump(state, f, indent=2, default=str)
 
-def load_watcher_state():
-    if os.path.exists(WATCHER_FILE):
+def load_rr_state():
+    if os.path.exists(RR_STATE_FILE):
         try:
-            with open(WATCHER_FILE) as f: return json.load(f)
+            with open(RR_STATE_FILE) as f: return json.load(f)
         except: pass
-    return {
-        "active": False, "current_streamer": None, "watch_time": 0,
-        "total_watch_time": 0, "streams_watched": 0, "rewards_claimed": 0,
-        "started_at": None, "last_event": None,
-    }
+    return {"active": False, "current_streamer": None, "streamers_watched": 0,
+            "total_watch_time": 0, "rewards_claimed": 0, "started_at": None, "per_streamer": {}}
 
-def save_watcher_state(ws):
-    with open(WATCHER_FILE, "w") as f: json.dump(ws, f, indent=2, default=str)
+def save_rr_state(s):
+    with open(RR_STATE_FILE, "w") as f: json.dump(s, f, indent=2, default=str)
 
-# ---- Dashboard ----
-class DashHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        subs = load_subs()
-        state = load_state()
-        watcher = load_watcher_state()
-        known = state.get("known", {})
-        active = sum(1 for d in subs.values() if d.get("active", True))
-        rows = ""
-        for sid, d in subs.items():
-            st = "Active" if d.get("active", True) else "Inactive"
-            color = "#4CAF50" if d.get("active", True) else "#f44336"
-            rows += f"<tr><td>{sid}</td><td style='color:{color}'>{st}</td><td>{d.get('added_at','?')[:16]}</td></tr>"
-        drops = ""
-        for cid, c in known.items():
-            st = c.get("status", "?")
-            color = {"active": "#4CAF50", "expired": "#999"}.get(st, "#FF9800")
-            drops += f"<tr><td>{c.get('name','?')}</td><td style='color:{color}'>{st}</td></tr>"
-        ws = "ACTIVE" if watcher.get("active") else "STOPPED"
-        wc = "#4CAF50" if watcher.get("active") else "#f44336"
-        current = watcher.get("current_streamer", "None")
-        wtime = watcher.get("total_watch_time", 0)
-        wh, wm = wtime // 3600, (wtime % 3600) // 60
-        html = f"""<!DOCTYPE html><html><head><title>Kick Drops</title>
-<meta http-equiv="refresh" content="30">
-<style>body{{font-family:Arial;background:#1a1a2e;color:#eee;padding:20px}}h1{{color:#e94560}}.c{{background:#16213e;padding:20px;border-radius:10px;margin:10px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;text-align:left;border-bottom:1px solid #333}}th{{background:#0f3460}}</style></head><body>
-<h1>Kick Stake Drops Bot v8</h1>
-<div class="c"><h2>Status</h2><p>Polls: {state.get('polls',0)}</p><p>Last: {state.get('last_poll','never')}</p></div>
-<div class="c"><h2>Auto-Watcher</h2><p style='color:{wc};font-size:1.2em'><b>{ws}</b></p><p>Streamer: {current}</p><p>Watch Time: {wh}h {wm}m</p><p>Streams: {watcher.get('streams_watched',0)}</p><p>Claimed: {watcher.get('rewards_claimed',0)}</p></div>
-<div class="c"><h2>Users ({active}/{len(subs)})</h2><table><tr><th>ID</th><th>Status</th><th>Joined</th></tr>{rows}</table></div>
-<div class="c"><h2>Drops ({len(known)})</h2><table><tr><th>Name</th><th>Status</th></tr>{drops}</table></div></body></html>"""
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
-        self.end_headers()
-        self.wfile.write(html.encode())
-    def log_message(self, *a): pass
+# ---- Auto-Claim Feature ----
+auto_claim_enabled = True  # Default ON
 
-# ---- REAL WebSocket Stream Watcher ----
-class StreamWatcher:
+def auto_claim_new_drop(campaign):
+    """When a new Stake drop is detected, watch its streamers and claim"""
+    try:
+        name = campaign.get("name", "?")
+        channels = campaign.get("channels", [])
+        campaign_id = campaign.get("id")
+        
+        if not channels:
+            log(f"[AUTO-CLAIM] No channels for {name}, skipping")
+            return
+        
+        # Find live streamers from this campaign
+        live_streamers = []
+        for ch in channels:
+            username = ch.get("slug") or ch.get("user", {}).get("username")
+            if not username:
+                continue
+            info = get_channel_info(username)
+            if info and info.get("is_live"):
+                live_streamers.append(info)
+            time.sleep(0.5)
+        
+        if not live_streamers:
+            log(f"[AUTO-CLAIM] No live streamers for {name}")
+            return
+        
+        tg_send(f"<b>AUTO-CLAIM:</b> Watching {name} streamers...\n" + ", ".join([s["username"] for s in live_streamers]))
+        
+        # Watch each live streamer for enough time to claim
+        for streamer in live_streamers:
+            username = streamer["username"]
+            channel_id = streamer["channel_id"]
+            livestream_id = streamer.get("livestream_id")
+            
+            log(f"[AUTO-CLAIM] Watching {username} for {name}")
+            _watch_and_claim(username, channel_id, livestream_id, campaign_id)
+            
+            # Check and claim after watching
+            _check_and_claim_sync()
+            
+    except Exception as e:
+        log(f"[AUTO-CLAIM] Error: {e}")
+
+def _watch_and_claim(username, channel_id, livestream_id, campaign_id, minutes=5):
+    """Watch a streamer for X minutes via WebSocket, then check claim"""
+    target_seconds = minutes * 60
+    
+    for attempt in range(3):
+        try:
+            ws_token = get_ws_token(get_cookie())
+            if not ws_token:
+                log(f"[AUTO-CLAIM] No WS token for {username}")
+                return False
+            
+            ws_url = WS_URL_TEMPLATE.format(token=ws_token)
+            headers = {k: v for k, v in BASE_HEADERS.items()}
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_ws_watch_loop(
+                    ws_url, headers, channel_id, livestream_id, 
+                    username, target_seconds
+                ))
+            finally:
+                loop.close()
+            return True
+            
+        except Exception as e:
+            log(f"[AUTO-CLAIM] Watch error for {username}: {e}")
+            if attempt < 2:
+                time.sleep(5 * (2 ** attempt))
+    return False
+
+async def _ws_watch_loop(ws_url, headers, channel_id, livestream_id, username, target_seconds):
+    """Async WebSocket watch loop"""
+    async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10, close_timeout=5) as ws:
+        # Handshake
+        handshake = json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}})
+        await ws.send(handshake)
+        
+        # Initial user_event
+        await send_user_event(ws, channel_id, livestream_id)
+        log(f"[AUTO-CLAIM] Connected to {username}")
+        
+        start_time = time.time()
+        last_user_event = time.time()
+        last_ping = time.time()
+        event_count = 1
+        
+        while True:
+            now = time.time()
+            elapsed = now - start_time
+            
+            # Time's up
+            if elapsed >= target_seconds:
+                log(f"[AUTO-CLAIM] Done watching {username} ({int(elapsed)}s)")
+                return
+            
+            # Ping every 20s
+            if now - last_ping >= 20:
+                try:
+                    await ws.send(json.dumps({"type": "ping"}))
+                    last_ping = now
+                    try:
+                        await asyncio.wait_for(ws.recv(), timeout=3)
+                    except asyncio.TimeoutError:
+                        pass
+                except Exception:
+                    pass
+            
+            # user_event every 60s
+            if now - last_user_event >= 60:
+                await send_user_event(ws, channel_id, livestream_id)
+                event_count += 1
+                last_user_event = now
+                remaining = int(target_seconds - elapsed)
+                log(f"[AUTO-CLAIM] user_event #{event_count} for {username} ({remaining}s left)")
+            
+            await asyncio.sleep(1)
+
+def _check_and_claim_sync():
+    """Check progress and claim rewards synchronously"""
+    try:
+        progress = fetch_progress()
+        if not progress:
+            return
+        for item in progress:
+            campaign_id = item.get("campaign_id") or item.get("id")
+            for r in item.get("rewards", []):
+                reward_id = r.get("reward_id") or r.get("id")
+                claimed = r.get("claimed", False)
+                required = r.get("required_units", 0)
+                current = r.get("progress", 0)
+                if not claimed and required > 0 and current >= required:
+                    log(f"[AUTO-CLAIM] Claiming reward: {reward_id}")
+                    result = claim_reward(campaign_id, reward_id)
+                    if result:
+                        tg_send(f"<b>REWARD CLAIMED!</b>\n\nCampaign: {campaign_id[:16]}...\nReward: {reward_id[:16]}...")
+                        log(f"[AUTO-CLAIM] Claimed: {reward_id}")
+    except Exception as e:
+        log(f"[AUTO-CLAIM] Claim check error: {e}")
+
+def toggle_auto_claim(enable):
+    global auto_claim_enabled
+    auto_claim_enabled = enable
+    return "ON" if enable else "OFF"
+
+def get_auto_claim_status():
+    return "ON" if auto_claim_enabled else "OFF"
+
+# ---- Round-Robin Watcher ----
+class RoundRobinWatcher:
     def __init__(self):
         self.active = False
         self.stop_event = threading.Event()
-        self.current_streamer = None
         self.watch_thread = None
-        self.state = load_watcher_state()
+        self.state = load_rr_state()
         self._lock = threading.Lock()
+        self.min_per_streamer = 7
 
     def _save(self):
         with self._lock:
-            save_watcher_state(self.state)
+            save_rr_state(self.state)
 
-    def start(self, category_id=None, target_minutes=0):
+    def start(self, minutes_per_streamer=7):
         if self.active:
-            return False, "Already watching!"
+            return False, "Already watching! Use /watchroundstop first."
+        self.min_per_streamer = minutes_per_streamer
         self.stop_event.clear()
         self.active = True
         self.state["active"] = True
@@ -269,17 +435,32 @@ class StreamWatcher:
         self._save()
         self.watch_thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self.watch_thread.start()
-        return True, "Auto-watcher started! (Real WebSocket)"
+        return True, f"<b>ROUND-ROBIN STARTED!</b>\n\nWatching each streamer for {minutes_per_streamer} min then switching.\nAuto-claiming rewards when ready."
 
     def stop(self):
         if not self.active:
-            return False, "Not watching anything!"
+            return False, "Not watching!"
         self.stop_event.set()
         self.active = False
         self.state["active"] = False
         self.state["current_streamer"] = None
         self._save()
-        return True, "Auto-watcher stopped!"
+        return True, f"<b>ROUND-ROBIN STOPPED!</b>\nStreams: {self.state.get('streamers_watched', 0)}\nClaimed: {self.state.get('rewards_claimed', 0)}"
+
+    def get_status(self):
+        if not self.active:
+            return "<b>ROUND-ROBIN: IDLE</b>\n\nUse /watchround to start."
+        current = self.state.get("current_streamer", "None")
+        watched = self.state.get("streamers_watched", 0)
+        total = self.state.get("total_watch_time", 0)
+        th, tm = total // 3600, (total % 3600) // 60
+        claimed = self.state.get("rewards_claimed", 0)
+        return (f"<b>ROUND-ROBIN: ACTIVE</b>\n\n"
+                f"Current: {current}\n"
+                f"Min per stream: {self.min_per_streamer}\n"
+                f"Streams watched: {watched}\n"
+                f"Total watch time: {th}h {tm}m\n"
+                f"Rewards claimed: {claimed}")
 
     def _run_async_loop(self):
         loop = asyncio.new_event_loop()
@@ -287,167 +468,111 @@ class StreamWatcher:
         try:
             loop.run_until_complete(self._main_loop())
         except Exception as e:
-            log(f"Async loop error: {e}")
+            log(f"RR loop error: {e}")
         finally:
             loop.close()
 
     async def _main_loop(self):
-        log("Watcher async loop started")
+        log("Round-Robin watcher started")
         while not self.stop_event.is_set():
             try:
-                campaigns, ok = await asyncio.get_event_loop().run_in_executor(None, fetch_campaigns)
+                campaigns, _ = await asyncio.get_event_loop().run_in_executor(None, fetch_campaigns)
                 if not campaigns:
-                    await asyncio.sleep(30)
-                    continue
+                    await asyncio.sleep(30); continue
 
-                stake_campaigns = [c for c in campaigns if is_stake_drop(c) and c.get("status") == "active" and c.get("channels")]
-                if not stake_campaigns:
-                    await asyncio.sleep(30)
-                    continue
+                streamers = []
+                for c in campaigns:
+                    if is_stake_drop(c) and c.get("status") == "active":
+                        for ch in c.get("channels", []):
+                            username = ch.get("slug") or ch.get("user", {}).get("username")
+                            if username: streamers.append(username)
 
-                for campaign in stake_campaigns:
+                if not streamers:
+                    log("No Stake campaigns with channels, waiting..."); await asyncio.sleep(30); continue
+
+                live_streamers = []
+                for username in streamers:
                     if self.stop_event.is_set(): break
-                    for ch in campaign.get("channels", []):
-                        if self.stop_event.is_set(): break
-                        username = ch.get("slug") or ch.get("user", {}).get("username")
-                        if not username: continue
-                        info = await asyncio.get_event_loop().run_in_executor(None, get_channel_info, username)
-                        if not info or not info.get("is_live"): continue
+                    info = await asyncio.get_event_loop().run_in_executor(None, get_channel_info, username)
+                    if info and info.get("is_live"):
+                        live_streamers.append(info)
+                    await asyncio.sleep(0.5)
 
-                        log(f"Watching: {username} ({campaign.get('name', '?')})")
-                        self.state["current_streamer"] = username
+                if not live_streamers:
+                    log("No live streamers, waiting..."); await asyncio.sleep(30); continue
+
+                log(f"Found {len(live_streamers)} live streamers")
+
+                for streamer in live_streamers:
+                    if self.stop_event.is_set(): break
+                    username = streamer["username"]
+                    channel_id = streamer["channel_id"]
+                    livestream_id = streamer.get("livestream_id")
+                    self.state["current_streamer"] = username
+                    self._save()
+                    log(f"Watching {username} for {self.min_per_streamer} min...")
+                    tg_send(f"<b>SWITCHING:</b> Now watching {username} ({self.min_per_streamer} min)")
+                    success = await self._watch_stream(username, channel_id, livestream_id)
+                    if success:
+                        with self._lock:
+                            self.state["streamers_watched"] = self.state.get("streamers_watched", 0) + 1
+                            self.state["per_streamer"][username] = self.state.get("per_streamer", {}).get(username, 0) + self.min_per_streamer * 60
                         self._save()
-                        await self._watch_stream_ws(username, info["channel_id"], info.get("livestream_id"), campaign)
-                        if self.stop_event.is_set(): break
+                    await self._check_and_claim()
 
-                if not self.stop_event.is_set():
-                    await asyncio.sleep(10)
             except Exception as e:
-                log(f"Main loop error: {e}")
-                await asyncio.sleep(15)
-        log("Watcher async loop ended")
+                log(f"RR main loop error: {e}"); await asyncio.sleep(15)
+        log("Round-Robin watcher stopped")
 
-    async def _watch_stream_ws(self, username, channel_id, livestream_id, campaign):
-        """Actually connect to Kick WebSocket and send real user_events with reconnection"""
-        max_retries = 5
-        retry_delay = 5
-        
-        for attempt in range(max_retries):
-            if self.stop_event.is_set():
-                break
-                
+    async def _watch_stream(self, username, channel_id, livestream_id):
+        target_seconds = self.min_per_streamer * 60
+        for attempt in range(3):
+            if self.stop_event.is_set(): return False
             try:
-                ws_token = await asyncio.get_event_loop().run_in_executor(None, get_ws_token, COOKIE)
-                if not ws_token:
-                    log(f"Failed to get WS token for {username}")
-                    return
-
+                ws_token = await asyncio.get_event_loop().run_in_executor(None, get_ws_token, get_cookie())
+                if not ws_token: log(f"No WS token for {username}"); return False
                 ws_url = WS_URL_TEMPLATE.format(token=ws_token)
                 headers = {k: v for k, v in BASE_HEADERS.items()}
-
-                log(f"Connecting WebSocket for {username} (attempt {attempt + 1}/{max_retries})...")
-
                 async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10, close_timeout=5) as ws:
-                    # Step 1: Send channel_handshake
                     handshake = json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}})
                     await ws.send(handshake)
-                    log(f"Handshake sent for {username}")
-
-                    # Step 2: Send initial user_event
                     await send_user_event(ws, channel_id, livestream_id)
-                    log(f"Initial user_event sent for {username}")
-
+                    log(f"Connected to {username}")
                     start_time = time.time()
                     last_user_event = time.time()
                     last_ping = time.time()
                     event_count = 1
-                    watch_success = True
-
-                    # Step 3: Main WS loop - ping + user_event
                     while not self.stop_event.is_set():
-                        try:
-                            now = time.time()
-
-                            # Send ping every ~20 seconds
-                            if now - last_ping >= 20:
+                        now = time.time()
+                        elapsed = now - start_time
+                        if elapsed >= target_seconds:
+                            log(f"Time up for {username} ({int(elapsed)}s), switching..."); return True
+                        if now - last_ping >= 20:
+                            try:
                                 await ws.send(json.dumps({"type": "ping"}))
                                 last_ping = now
-                                # Wait for pong response
-                                try:
-                                    pong = await asyncio.wait_for(ws.recv(), timeout=5)
-                                except asyncio.TimeoutError:
-                                    pass
-
-                            # Send user_event every 60 seconds
-                            if now - last_user_event >= 60:
-                                await send_user_event(ws, channel_id, livestream_id)
-                                event_count += 1
-                                last_user_event = now
-                                log(f"user_event #{event_count} sent for {username}")
-
-                            # Update local state
-                            elapsed = int(now - start_time)
+                                try: await asyncio.wait_for(ws.recv(), timeout=3)
+                                except asyncio.TimeoutError: pass
+                            except Exception: pass
+                        if now - last_user_event >= 60:
+                            await send_user_event(ws, channel_id, livestream_id)
+                            event_count += 1
+                            last_user_event = now
                             with self._lock:
-                                self.state["watch_time"] = elapsed
-                                self.state["total_watch_time"] = self.state.get("total_watch_time", 0) + 1
-                                self.state["last_event"] = datetime.now().isoformat()
-                                self._save()
-
-                            # Check if stream went offline
-                            if event_count % 5 == 0:
-                                info = await asyncio.get_event_loop().run_in_executor(None, get_channel_info, username)
-                                if not info or not info.get("is_live"):
-                                    log(f"Stream {username} went offline, switching...")
-                                    watch_success = True  # Expected behavior, not failure
-                                    break
-
-                            # Check target time
-                            target = self.state.get("target_minutes", 0)
-                            if target > 0 and elapsed >= target * 60:
-                                log(f"Target time reached for {username}")
-                                break
-
-                            # Check and claim rewards periodically
-                            if event_count % 5 == 0:
-                                await self._check_and_claim()
-
-                            # Small delay to prevent tight loop
-                            await asyncio.sleep(1)
-
-                        except websockets.ConnectionClosed:
-                            log(f"WS connection closed for {username}, reconnecting...")
-                            watch_success = False
-                            break
-                        except asyncio.CancelledError:
-                            log(f"Watcher cancelled for {username}")
-                            watch_success = False
-                            break
-                        except Exception as e:
-                            log(f"WS loop error: {e}")
-                            watch_success = False
-                            break
-
-                # Increment streams_watched only on successful watch
-                if watch_success and event_count > 1:
-                    with self._lock:
-                        self.state["streams_watched"] = self.state.get("streams_watched", 0) + 1
-                        self._save()
-                
-                # If we broke out successfully, don't retry
-                if watch_success or self.stop_event.is_set():
-                    break
-                    
-            except asyncio.CancelledError:
-                log(f"Watcher cancelled for {username}")
-                break
+                                self.state["total_watch_time"] = self.state.get("total_watch_time", 0) + 60
+                            self._save()
+                            remaining = int(target_seconds - elapsed)
+                            log(f"user_event #{event_count} for {username} ({remaining}s left)")
+                        if event_count % 5 == 0:
+                            info = await asyncio.get_event_loop().run_in_executor(None, get_channel_info, username)
+                            if not info or not info.get("is_live"):
+                                log(f"{username} went offline"); return True
+                        await asyncio.sleep(1)
             except Exception as e:
-                log(f"WebSocket watch error for {username}: {e}")
-                
-            # Exponential backoff retry
-            if attempt < max_retries - 1 and not self.stop_event.is_set():
-                wait_time = retry_delay * (2 ** attempt)
-                log(f"Retrying {username} in {wait_time}s...")
-                await asyncio.sleep(wait_time)
+                log(f"Watch error for {username}: {e}")
+                if attempt < 2: await asyncio.sleep(5 * (2 ** attempt))
+                else: return False
+        return False
 
     async def _check_and_claim(self):
         try:
@@ -466,210 +591,52 @@ class StreamWatcher:
                         if result:
                             with self._lock:
                                 self.state["rewards_claimed"] = self.state.get("rewards_claimed", 0) + 1
-                                self._save()
+                            self._save()
                             tg_send(f"<b>REWARD CLAIMED!</b>\n\nCampaign: {campaign_id[:16]}...\nReward: {reward_id[:16]}...")
                             log(f"Reward claimed: {reward_id}")
         except Exception as e:
             log(f"Claim check error: {e}")
 
-    def get_status(self):
-        with self._lock:
-            self.state = load_watcher_state()
-            return dict(self.state)
+rr_watcher = RoundRobinWatcher()
 
-watcher = StreamWatcher()
-
-# ---- Shared WebSocket Helpers ----
-async def send_user_event(ws, channel_id, livestream_id):
-    """Send the actual user_event that Kick tracks for watch time"""
-    event = {
-        "type": "user_event",
-        "data": {
-            "message": {
-                "name": "tracking.user.watch.livestream",
-                "channel_id": channel_id,
-                "livestream_id": int(livestream_id) if livestream_id else int(channel_id),
-            }
-        }
-    }
-    await ws.send(json.dumps(event))
-
-# ---- Manual Stream Tester ----
-class ManualStreamTester:
-    """Test watching a specific streamer via WebSocket"""
-    def __init__(self):
-        self.active = False
-        self.stop_event = threading.Event()
-        self.current_streamer = None
-        self.watch_thread = None
-        self._lock = threading.Lock()
-        self.watch_data = {"events_sent": 0, "start_time": None, "status": "idle"}
-
-    def start(self, username, chat_id):
-        """Start watching a specific streamer"""
-        if self.active:
-            return False, "Already watching a streamer! Use /watchteststop first."
-        
-        # Check if streamer exists and is live
-        info = get_channel_info(username)
-        if not info:
-            return False, f"Could not find streamer: {username}"
-        if not info.get("is_live"):
-            return False, f"<b>{username}</b> is OFFLINE right now. Try when they're live!"
-        
-        self.stop_event.clear()
-        self.active = True
-        self.current_streamer = username
-        self.watch_data = {"events_sent": 0, "start_time": time.time(), "status": "connecting"}
-        
-        self.watch_thread = threading.Thread(target=self._watch_loop, args=(username, info, chat_id), daemon=True)
-        self.watch_thread.start()
-        
-        return True, f"<b>WATCHING: {username}</b>\n\nChannel ID: {info['channel_id']}\nLivestream ID: {info.get('livestream_id')}\n\nWebSocket connecting... Check /watchteststatus for updates."
-
-    def stop(self):
-        """Stop watching"""
-        if not self.active:
-            return False, "Not watching anything!"
-        self.stop_event.set()
-        self.active = False
-        self.watch_data["status"] = "stopped"
-        return True, f"<b>STOPPED watching {self.current_streamer}</b>\nEvents sent: {self.watch_data['events_sent']}"
-
-    def get_status(self):
-        """Get current test status"""
-        if not self.active:
-            return "<b>TEST MODE: IDLE</b>\n\nUse /watchtest <username> to start."
-        
-        elapsed = int(time.time() - self.watch_data.get("start_time", time.time()))
-        mins, secs = divmod(elapsed, 60)
-        
-        return (f"<b>TEST MODE: ACTIVE</b>\n\n"
-                f"Streamer: {self.current_streamer}\n"
-                f"Status: {self.watch_data['status']}\n"
-                f"Events Sent: {self.watch_data['events_sent']}\n"
-                f"Watch Time: {mins}m {secs}s")
-
-    def _watch_loop(self, username, info, chat_id):
-        """WebSocket watch loop for testing"""
-        channel_id = info["channel_id"]
-        livestream_id = info.get("livestream_id")
-        
-        log(f"[TEST] Starting WebSocket watch for {username}")
-        
-        # Run async loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._async_watch(username, channel_id, livestream_id, chat_id))
-        except Exception as e:
-            log(f"[TEST] Error: {e}")
-            tg_send(f"<b>TEST ERROR:</b> {e}", chat_id=chat_id)
-        finally:
-            loop.close()
-            self.active = False
-            self.watch_data["status"] = "ended"
-            log(f"[TEST] Watch ended for {username}. Events sent: {self.watch_data['events_sent']}")
-
-    async def _async_watch(self, username, channel_id, livestream_id, chat_id):
-        """Async WebSocket watching with real-time Telegram updates"""
-        max_retries = 3
-        
-        for attempt in range(max_retries):
-            if self.stop_event.is_set():
-                break
-            
-            try:
-                # Get WS token
-                ws_token = await asyncio.get_event_loop().run_in_executor(None, get_ws_token, COOKIE)
-                if not ws_token:
-                    tg_send(f"<b>ERROR:</b> Could not get WebSocket token. Cookie might be expired.", chat_id=chat_id)
-                    return
-                
-                ws_url = WS_URL_TEMPLATE.format(token=ws_token)
-                headers = {k: v for k, v in BASE_HEADERS.items()}
-                
-                tg_send(f"<b>CONNECTING...</b>\nAttempt {attempt + 1}/{max_retries}", chat_id=chat_id)
-                
-                async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
-                    self.watch_data["status"] = "connected"
-                    log(f"[TEST] WebSocket connected for {username}")
-                    
-                    # Send channel_handshake
-                    handshake = json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}})
-                    await ws.send(handshake)
-                    tg_send(f"<b>CONNECTED!</b>\n\nHandshake sent. Starting user_events...", chat_id=chat_id)
-                    
-                    # Send initial user_event
-                    await send_user_event(ws, channel_id, livestream_id)
-                    self.watch_data["events_sent"] += 1
-                    self.watch_data["status"] = "watching"
-                    
-                    tg_send(f"<b>FIRST user_event SENT!</b>\n\nNow sending every 60 seconds...\nUse /watchteststatus to check.\nUse /watchteststop to stop.", chat_id=chat_id)
-                    
-                    last_user_event = time.time()
-                    last_ping = time.time()
-                    start_time = time.time()
-                    
-                    # Main loop
-                    while not self.stop_event.is_set():
-                        now = time.time()
-                        
-                        # Send ping every 20s
-                        if now - last_ping >= 20:
-                            try:
-                                await ws.send(json.dumps({"type": "ping"}))
-                                last_ping = now
-                                try:
-                                    await asyncio.wait_for(ws.recv(), timeout=3)
-                                except asyncio.TimeoutError:
-                                    pass
-                            except Exception as e:
-                                log(f"[TEST] Ping error: {e}")
-                        
-                        # Send user_event every 60s
-                        if now - last_user_event >= 60:
-                            await send_user_event(ws, channel_id, livestream_id)
-                            self.watch_data["events_sent"] += 1
-                            last_user_event = now
-                            
-                            elapsed = int(now - start_time)
-                            mins, secs = divmod(elapsed, 60)
-                            log(f"[TEST] user_event #{self.watch_data['events_sent']} sent ({mins}m {secs}s elapsed)")
-                        
-                        # Check if still live every 30s
-                        if self.watch_data["events_sent"] % 3 == 0:
-                            info = await asyncio.get_event_loop().run_in_executor(None, get_channel_info, username)
-                            if not info or not info.get("is_live"):
-                                tg_send(f"<b>STREAM ENDED:</b> {username} went offline.", chat_id=chat_id)
-                                self.watch_data["status"] = "stream_ended"
-                                break
-                        
-                        await asyncio.sleep(1)
-                
-                # If we exited normally and not stopped, might need reconnect
-                if not self.stop_event.is_set():
-                    tg_send(f"<b>CONNECTION LOST</b>\nReconnecting in 5s...", chat_id=chat_id)
-                    await asyncio.sleep(5)
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log(f"[TEST] Error: {e}")
-                self.watch_data["status"] = f"error: {str(e)[:50]}"
-                if attempt < max_retries - 1:
-                    tg_send(f"<b>ERROR:</b> {e}\nRetrying in {5 * (2**attempt)}s...", chat_id=chat_id)
-                    await asyncio.sleep(5 * (2 ** attempt))
-                else:
-                    tg_send(f"<b>FATAL ERROR:</b> {e}\n\nMax retries reached. Test ended.", chat_id=chat_id)
-        
-        # Final summary
-        elapsed = int(time.time() - self.watch_data.get("start_time", time.time()))
-        mins, secs = divmod(elapsed, 60)
-        tg_send(f"<b>TEST COMPLETE</b>\n\nStreamer: {username}\nEvents Sent: {self.watch_data['events_sent']}\nDuration: {mins}m {secs}s\nStatus: {self.watch_data['status']}", chat_id=chat_id)
-
-# Initialize tester
-tester = ManualStreamTester()
+# ---- Dashboard ----
+class DashboardHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        state = load_state()
+        rr = load_rr_state()
+        known = state.get("known", {})
+        subs = load_subs()
+        active = sum(1 for s in subs.values() if s.get("active", True))
+        rows = ""
+        for sid, d in subs.items():
+            st = "Active" if d.get("active", True) else "Inactive"
+            color = "#4CAF50" if d.get("active", True) else "#f44336"
+            rows += f"<tr><td>{sid}</td><td style='color:{color}'>{st}</td><td>{d.get('added_at','?')[:16]}</td></tr>"
+        drops = ""
+        for cid, c in known.items():
+            st = c.get("status", "?")
+            color = {"active": "#4CAF50", "expired": "#999"}.get(st, "#FF9800")
+            drops += f"<tr><td>{c.get('name','?')}</td><td style='color:{color}'>{st}</td></tr>"
+        rr_status = "ACTIVE" if rr.get("active") else "STOPPED"
+        rr_color = "#4CAF50" if rr.get("active") else "#f44336"
+        rr_streamer = rr.get("current_streamer", "None")
+        rr_watched = rr.get("streamers_watched", 0)
+        rr_claimed = rr.get("rewards_claimed", 0)
+        total = rr.get("total_watch_time", 0)
+        th, tm = total // 3600, (total % 3600) // 60
+        html = f"""<!DOCTYPE html><html><head><title>Kick Drops v9</title>
+<meta http-equiv="refresh" content="30">
+<style>body{{font-family:Arial;background:#1a1a2e;color:#eee;padding:20px}}h1{{color:#e94560}}.c{{background:#16213e;padding:20px;border-radius:10px;margin:10px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;text-align:left;border-bottom:1px solid #333}}th{{background:#0f3460}}</style></head><body>
+<h1>Kick Stake Drops Bot v9</h1>
+<div class="c"><h2>Status</h2><p>Polls: {state.get('polls',0)}</p><p>Last: {state.get('last_poll','never')}</p></div>
+<div class="c"><h2>Round-Robin Watcher</h2><p style='color:{rr_color};font-size:1.2em'><b>{rr_status}</b></p><p>Streamer: {rr_streamer}</p><p>Watch Time: {th}h {tm}m</p><p>Streams: {rr_watched}</p><p>Claimed: {rr_claimed}</p></div>
+<div class="c"><h2>Users ({active}/{len(subs)})</h2><table><tr><th>ID</th><th>Status</th><th>Joined</th></tr>{rows}</table></div>
+<div class="c"><h2>Drops ({len(known)})</h2><table><tr><th>Name</th><th>Status</th></tr>{drops}</table></div></body></html>"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(html.encode())
+    def log_message(self, *a): pass
 
 # ---- Commands ----
 def handle_command(cmd, chat_id, text=""):
@@ -677,10 +644,12 @@ def handle_command(cmd, chat_id, text=""):
         is_new = add_sub(chat_id)
         if is_new:
             tg_send_admin(f"NEW USER: {chat_id}\nTotal: {len(get_active_subs())}")
-        tg_send("<b>Kick Stake Drops Bot v8</b>\n\n/all /stake /status /setcookie\n/watch /watchstop /watchstatus\n/watchtest /watchteststop /watchteststatus\n/stop", chat_id=chat_id)
+        tg_send("<b>Kick Stake Drops Bot v9</b>\n\n<b>Drops:</b> /all /stake /status\n<b>Auto-Claim:</b> /autoclaim on/off\n<b>Round-Robin:</b> /watchround [min] /watchroundstop /watchroundstatus\n<b>Config:</b> /setcookie /stop", chat_id=chat_id)
+
     elif cmd == "/stop":
         remove_sub(chat_id)
         tg_send("Unsubscribed.", chat_id=chat_id)
+
     elif cmd == "/all":
         campaigns, _ = fetch_campaigns()
         if not campaigns:
@@ -688,6 +657,7 @@ def handle_command(cmd, chat_id, text=""):
         msg = f"<b>All ({len(campaigns)}):</b>\n\n"
         for c in campaigns: msg += fmt_campaign(c) + "\n\n"
         for i in range(0, len(msg), 4000): tg_send(msg[i:i+4000], chat_id=chat_id)
+
     elif cmd == "/stake":
         campaigns, _ = fetch_campaigns()
         if not campaigns:
@@ -698,61 +668,47 @@ def handle_command(cmd, chat_id, text=""):
         msg = f"<b>Stake ({len(stake)}):</b>\n\n"
         for c in stake: msg += fmt_campaign(c) + "\n\n"
         tg_send(msg, chat_id=chat_id)
+
     elif cmd == "/status":
         state = load_state()
         tg_send(f"Polls: {state.get('polls',0)}\nDrops: {len(state.get('known',{}))}\nSubs: {len(get_active_subs())}", chat_id=chat_id)
+
     elif cmd == "/setcookie":
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
             tg_send("Usage: /setcookie &lt;cookie&gt;", chat_id=chat_id); return
-        global COOKIE
-        COOKIE = parts[1].strip()
+        save_cookie(parts[1].strip())
         tg_send("Cookie updated!", chat_id=chat_id)
         tg_send_admin(f"Cookie updated by {chat_id}")
-    elif cmd == "/watch":
-        parts = text.split()
-        minutes = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-        success, msg = watcher.start(target_minutes=minutes)
-        if success:
-            tg_send(f"<b>AUTO-WATCHER STARTED!</b>\n\nMode: Real WebSocket\nTarget: {'Unlimited' if minutes == 0 else f'{minutes} min per stream'}\n\nWatching Stake streams via WS and claiming drops automatically.", chat_id=chat_id)
-            tg_send_admin(f"Watcher started by {chat_id}")
-        else:
-            tg_send(msg, chat_id=chat_id)
-    elif cmd == "/watchstop":
-        success, msg = watcher.stop()
-        if success:
-            state = watcher.get_status()
-            tg_send(f"<b>AUTO-WATCHER STOPPED!</b>\n\nTotal watch time: {state.get('total_watch_time', 0)} sec\nStreams: {state.get('streams_watched', 0)}\nClaimed: {state.get('rewards_claimed', 0)}", chat_id=chat_id)
-        else:
-            tg_send(msg, chat_id=chat_id)
-    elif cmd == "/watchstatus":
-        state = watcher.get_status()
-        status = "ACTIVE" if state.get("active") else "STOPPED"
-        current = state.get("current_streamer", "None")
-        wtime = state.get("total_watch_time", 0)
-        wh, wm = wtime // 3600, (wtime % 3600) // 60
-        tg_send(f"<b>WATCHER STATUS</b>\n\nStatus: {status}\nStreamer: {current}\nWatch Time: {wh}h {wm}m\nStreams: {state.get('streams_watched', 0)}\nClaimed: {state.get('rewards_claimed', 0)}", chat_id=chat_id)
 
-    # ---- Manual Test Commands ----
-    elif cmd == "/watchtest":
+    elif cmd == "/autoclaim":
         parts = text.split()
-        if len(parts) < 2:
-            tg_send("<b>USAGE:</b> /watchtest &lt;username&gt;\n\nExample: /watchtest ramee\n\nThis will test WebSocket watching on a specific streamer.", chat_id=chat_id)
-            return
-        username = parts[1].strip().lower()
-        tg_send(f"<b>CHECKING:</b> Is {username} live?...", chat_id=chat_id)
-        success, msg = tester.start(username, chat_id)
+        if len(parts) > 1 and parts[1].lower() in ("on", "1", "yes"):
+            status = toggle_auto_claim(True)
+            tg_send(f"<b>Auto-Claim: {status}</b>\n\nNow auto-watches and claims new drops.", chat_id=chat_id)
+        elif len(parts) > 1 and parts[1].lower() in ("off", "0", "no"):
+            status = toggle_auto_claim(False)
+            tg_send(f"<b>Auto-Claim: {status}</b>", chat_id=chat_id)
+        else:
+            status = get_auto_claim_status()
+            tg_send(f"<b>Auto-Claim: {status}</b>\n\nUsage: /autoclaim on | /autoclaim off\n\nWhen ON, bot auto-watches and claims new Stake drops.", chat_id=chat_id)
+
+    elif cmd == "/watchround":
+        parts = text.split()
+        minutes = 7
+        if len(parts) > 1 and parts[1].isdigit():
+            minutes = max(3, min(30, int(parts[1])))
+        success, msg = rr_watcher.start(minutes_per_streamer=minutes)
         tg_send(msg, chat_id=chat_id)
         if success:
-            tg_send_admin(f"Test started: watching {username} by {chat_id}")
+            tg_send_admin(f"Round-Robin started by {chat_id} ({minutes} min/stream)")
 
-    elif cmd == "/watchteststop":
-        success, msg = tester.stop()
+    elif cmd == "/watchroundstop":
+        success, msg = rr_watcher.stop()
         tg_send(msg, chat_id=chat_id)
 
-    elif cmd == "/watchteststatus":
-        status = tester.get_status()
-        tg_send(status, chat_id=chat_id)
+    elif cmd == "/watchroundstatus":
+        tg_send(rr_watcher.get_status(), chat_id=chat_id)
 
 # ---- Poller ----
 def poller():
@@ -783,11 +739,17 @@ def poller():
                 known[cid] = {"name": name, "status": status}
                 tg_send(f"<b>NEW STAKE DROP!</b>\n\n<b>{name}</b>\nStatus: {status}\nChannels: {', '.join(ch_names)}\nRewards: {', '.join(rew_names[:5])}\n\n<a href='https://kick.com/drops/all-campaigns'>Open Drops</a>")
                 log(f"NEW: {name} ({status})")
+                # Auto-claim: watch this drop's streamers immediately
+                if auto_claim_enabled:
+                    threading.Thread(target=auto_claim_new_drop, args=(c,), daemon=True).start()
             elif known[cid].get("status") != status:
                 known[cid]["status"] = status
                 if status == "active":
                     tg_send(f"<b>STAKE DROP LIVE!</b>\n\n<b>{name}</b>\n\n<a href='https://kick.com/drops/all-campaigns'>OPEN NOW</a>")
                     log(f"LIVE: {name}")
+                    # Auto-claim: stream just went live, watch it
+                    if auto_claim_enabled:
+                        threading.Thread(target=auto_claim_new_drop, args=(c,), daemon=True).start()
         if poll_count % 60 == 0:
             log(f"POLL #{poll_count} | {len(campaigns)} total | {len(stake_campaigns)} stake | {len(get_active_subs())} subs")
         state["known"] = known
@@ -799,12 +761,16 @@ def poller():
 # ---- Main ----
 def main():
     log("=" * 50)
-    log("KICK STAKE DROPS BOT v8 - REAL WEBSOCKET")
+    log("KICK STAKE DROPS BOT v9 - ROUND-ROBIN")
     log("=" * 50)
-    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashHandler).serve_forever(), daemon=True).start()
+    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
     log(f"Dashboard: port {DASHBOARD_PORT}")
     threading.Thread(target=poller, daemon=True).start()
-    tg_send_admin("<b>Bot v8 Started!</b>\n\nReal WebSocket auto-watcher enabled.\nCommands: /watch /watchstop /watchstatus")
+    try:
+        threading.Thread(target=session_keeper, daemon=True).start()
+    except Exception as e:
+        log(f"Keeper not started (playwright?): {e}")
+    tg_send_admin("<b>Bot v9 Started!</b>\n\nRound-Robin auto-watcher enabled.\nCommands: /watchround /watchroundstop /watchroundstatus")
     log("Listening...")
     offset = 0
     while True:
