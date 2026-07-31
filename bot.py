@@ -26,7 +26,7 @@ CLAIM_API = "https://web.kick.com/api/v1/drops/claim"
 CHANNEL_API = "https://kick.com/api/v2/channels/{username}"
 CHATROOM_API = "https://kick.com/api/v2/channels/{username}/chatroom"
 CHAT_SEND_API = "https://kick.com/api/v2/messages/send/{chatroom_id}"
-FOLLOW_API = "https://web.kick.com/api/v1/channels/{channel_id}/follow"
+FOLLOW_API = "https://kick.com/api/v2/channels/{channel_slug}/follow"
 FOLLOWED_API = "https://web.kick.com/api/v1/followed-channels"
 CATEGORY_LIVESTREAMS = "https://web.kick.com/api/v1/livestreams?category_id={cat_id}&limit=50&sort=viewer_count_desc"
 CATEGORIES_SEARCH = "https://kick.com/api/v2/categories"
@@ -210,30 +210,32 @@ def get_channel_info(username):
         }
     except: return None
 
-def follow_channel(channel_id):
-    """Follow a channel on Kick - POST request"""
+def follow_channel(username):
+    """Follow a channel on Kick - POST to correct v2 endpoint with slug"""
     try:
-        url = FOLLOW_API.format(channel_id=channel_id)
+        url = FOLLOW_API.format(channel_slug=username)
+        session_token = get_session_token()
         headers = dict(BASE_HEADERS)
+        headers["Content-Type"] = "application/json"
+        if session_token:
+            headers["Authorization"] = f"Bearer {session_token}"
         cookie = get_cookie()
         if cookie: headers["Cookie"] = "session=" + cookie
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-        headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=b"{}", method="POST")
         for k, v in headers.items(): req.add_header(k, v)
         resp = urllib.request.urlopen(req, timeout=10)
-        result = resp.read().decode()
-        log(f"[FOLLOW] OK channel_id={channel_id}")
+        log(f"[FOLLOW] OK @{username}")
         return True
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:200] if e.fp else ""
         if e.code == 409:
-            log(f"[FOLLOW] Already following {channel_id}")
+            log(f"[FOLLOW] Already following @{username}")
             return True
-        log(f"[FOLLOW] HTTP {e.code} channel_id={channel_id}: {body}")
+        log(f"[FOLLOW] HTTP {e.code} @{username}: {body}")
         return False
     except Exception as e:
-        log(f"[FOLLOW] Error channel_id={channel_id}: {e}")
+        log(f"[FOLLOW] Error @{username}: {e}")
         return False
 
 def get_followed_streamers():
@@ -489,9 +491,8 @@ def follow_drop_streamers(campaigns):
         if not is_stake_drop(c): continue
         for ch in c.get("channels", []):
             username = ch.get("slug") or ch.get("user", {}).get("username")
-            channel_id = ch.get("user", {}).get("id") or ch.get("id")
-            if username and channel_id and username not in already_followed:
-                if follow_channel(channel_id):
+            if username and username not in already_followed:
+                if follow_channel(username):
                     cache["usernames"].append(username)
                     followed_count += 1
                     time.sleep(0.5)
@@ -548,7 +549,7 @@ class SingleWatcher:
                 self.active = True
                 if not self.started_at:
                     self.started_at = datetime.now()
-            follow_channel(info["channel_id"])
+            follow_channel(username)
             threading.Thread(target=watcher.run, args=(chat_id,), daemon=True).start()
             started.append(f"@{username}")
             log(f"[WATCH] Started @{username}")
@@ -825,7 +826,7 @@ class ParallelWatcher:
                         self.state["watching"][username] = {"min": watch_min, "started": datetime.now().isoformat()}
                     self._save()
                     threading.Thread(target=watcher.run, daemon=True).start()
-                    follow_channel(streamer["channel_id"])
+                    follow_channel(username)
                     log(f"[PW] Started @{username} for {watch_min} min")
                     tg_send(f"<b>PW:</b> Watching @{username} ({watch_min} min)")
 
