@@ -1,11 +1,11 @@
 """
-Kick Stake Drops Bot v15
+Kick Stake Drops Bot v16
 - Parallel watcher: all live streams simultaneously
 - Smart claim: only check when claim window open (no API spam)
 - Category fallback: Slots & Casino if no Stake streamers
 - Follow streamers on watch + follow yesterday's drop streamers
-- Password-protected dashboard
-- Logs page on dashboard
+- Password-protected dashboard + logs page
+- Fixed follow API: POST kick.com/api/v2/channels/{slug}/follow
 """
 import urllib.request, json, time, os, threading, random, hashlib
 import asyncio
@@ -179,6 +179,8 @@ def kick_request(url, extra_headers=None, timeout=15):
     headers = dict(BASE_HEADERS)
     cookie = get_cookie()
     if cookie: headers["Cookie"] = "session=" + cookie
+    session_token = get_session_token()
+    if session_token: headers["Authorization"] = f"Bearer {session_token}"
     headers["X-Client-Token"] = KICK_CLIENT_TOKEN
     if extra_headers: headers.update(extra_headers)
     req = urllib.request.Request(url)
@@ -284,12 +286,10 @@ def get_ws_token(session_token):
     except: return None
 
 def get_session_token():
+    """Return full raw cookie as Bearer token (NOT decoded, NOT split)"""
     cookie = get_cookie()
     if not cookie: return None
-    import urllib.parse
-    decoded = urllib.parse.unquote(cookie)
-    if "|" in decoded: return decoded.split("|", 1)[1]
-    return decoded
+    return cookie
 
 def fetch_progress():
     try:
