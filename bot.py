@@ -27,7 +27,8 @@ CHANNEL_API = "https://kick.com/api/v2/channels/{username}"
 CHATROOM_API = "https://kick.com/api/v2/channels/{username}/chatroom"
 CHAT_SEND_API = "https://kick.com/api/v2/messages/send/{chatroom_id}"
 FOLLOW_API = "https://kick.com/api/v2/channels/{channel_slug}/follow"
-FOLLOWED_API = "https://web.kick.com/api/v1/followed-channels"
+FOLLOWED_API = "https://kick.com/api/v2/channels/followed"
+FOLLOW_COOLDOWN = {}  # username -> timestamp when retry allowed
 CATEGORY_LIVESTREAMS = "https://web.kick.com/api/v1/livestreams?category_id={cat_id}&limit=50&sort=viewer_count_desc"
 CATEGORIES_SEARCH = "https://kick.com/api/v2/categories"
 WS_TOKEN_API = "https://websockets.kick.com/viewer/v1/token"
@@ -44,11 +45,12 @@ DASHBOARD_PORT = int(os.environ.get("PORT", "8080"))
 KEEPER_INTERVAL = 1800
 SLOTS_CATEGORY_ID = None
 BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://kick.com",
     "Referer": "https://kick.com/",
+    "x-app-platform": "web",
 }
 # ================================
 
@@ -179,8 +181,6 @@ def kick_request(url, extra_headers=None, timeout=15):
     headers = dict(BASE_HEADERS)
     cookie = get_cookie()
     if cookie: headers["Cookie"] = "session=" + cookie
-    session_token = get_session_token()
-    if session_token: headers["Authorization"] = f"Bearer {session_token}"
     headers["X-Client-Token"] = KICK_CLIENT_TOKEN
     if extra_headers: headers.update(extra_headers)
     req = urllib.request.Request(url)
@@ -213,18 +213,20 @@ def get_channel_info(username):
     except: return None
 
 def follow_channel(username):
-    """Follow a channel on Kick - POST to correct v2 endpoint with slug"""
+    """Follow a channel on Kick - with 429 backoff"""
+    global FOLLOW_COOLDOWN
+    if username in FOLLOW_COOLDOWN:
+        if time.time() < FOLLOW_COOLDOWN[username]:
+            return False
     try:
         url = FOLLOW_API.format(channel_slug=username)
-        session_token = get_session_token()
         headers = dict(BASE_HEADERS)
         headers["Content-Type"] = "application/json"
-        if session_token:
-            headers["Authorization"] = f"Bearer {session_token}"
         cookie = get_cookie()
         if cookie: headers["Cookie"] = "session=" + cookie
+        headers["Authorization"] = f"Bearer {get_session_token()}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-        req = urllib.request.Request(url, data=b"{}", method="POST")
+        req = urllib.request.Request(url, method="POST")
         for k, v in headers.items(): req.add_header(k, v)
         resp = urllib.request.urlopen(req, timeout=10)
         log(f"[FOLLOW] OK @{username}")
@@ -234,6 +236,10 @@ def follow_channel(username):
         if e.code == 409:
             log(f"[FOLLOW] Already following @{username}")
             return True
+        if e.code == 429:
+            FOLLOW_COOLDOWN[username] = time.time() + 300
+            log(f"[FOLLOW] Rate limited @{username}, cooldown 5min")
+            return False
         log(f"[FOLLOW] HTTP {e.code} @{username}: {body}")
         return False
     except Exception as e:
@@ -243,8 +249,8 @@ def follow_channel(username):
 def get_followed_streamers():
     try:
         data = kick_request(FOLLOWED_API)
-        channels = data.get("data", [])
-        return [ch.get("slug") or ch.get("username") for ch in channels if ch.get("slug") or ch.get("username")]
+        channels = data.get("channels", [])
+        return [ch.get("channel_slug") or ch.get("user_username") for ch in channels if ch.get("channel_slug")]
     except: return []
 
 def get_chatroom_id(username):
@@ -286,18 +292,17 @@ def get_ws_token(session_token):
     except: return None
 
 def get_session_token():
-    """Return full raw cookie as Bearer token (NOT decoded, NOT split)"""
+    """Return decoded cookie as Bearer token - browser uses | not %7C"""
     cookie = get_cookie()
     if not cookie: return None
-    return cookie
+    import urllib.parse
+    return urllib.parse.unquote(cookie)
 
 def fetch_progress():
     try:
-        session_token = get_session_token()
-        if not session_token: return []
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + get_cookie()
-        headers["Authorization"] = f"Bearer {session_token}"
+        headers["Authorization"] = f"Bearer {get_session_token()}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
         req = urllib.request.Request(PROGRESS_API)
         for k, v in headers.items(): req.add_header(k, v)
@@ -307,11 +312,9 @@ def fetch_progress():
 
 def claim_reward(campaign_id, reward_id):
     try:
-        session_token = get_session_token()
-        if not session_token: return None
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + get_cookie()
-        headers["Authorization"] = f"Bearer {session_token}"
+        headers["Authorization"] = f"Bearer {get_session_token()}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
         headers["Content-Type"] = "application/json"
         body = json.dumps({"campaign_id": campaign_id, "reward_id": reward_id}).encode()
@@ -319,9 +322,15 @@ def claim_reward(campaign_id, reward_id):
         for k, v in headers.items(): req.add_header(k, v)
         resp = urllib.request.urlopen(req, timeout=15)
         result = json.loads(resp.read().decode())
-        log(f"Claim OK: {result}")
+        log(f"[CLAIM] OK: {result}")
         return result
-    except: return None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:300] if e.fp else ""
+        log(f"[CLAIM] HTTP {e.code}: {body}")
+        return None
+    except Exception as e:
+        log(f"[CLAIM] Error: {e}")
+        return None
 
 def search_slots_category():
     """Find Slots & Casino category ID"""
@@ -359,32 +368,37 @@ def get_slots_streamers():
     except: return []
 
 def smart_claim_check(username=None):
-    """Smart claim check - only when there's progress to claim. No spam."""
+    """Smart claim check - progress is RATIO (0-1), not seconds"""
     try:
         progress = fetch_progress()
         if not progress: return
         claimed_any = False
         for item in progress:
             campaign_id = item.get("campaign_id") or item.get("id")
+            total_progress = item.get("progress_units", 0)
             for r in item.get("rewards", []):
                 if r.get("claimed"): continue
                 required = r.get("required_units", 0)
-                current = r.get("progress", 0)
+                ratio = r.get("progress", 0)
                 reward_id = r.get("reward_id") or r.get("id")
-                if required > 0 and current >= required:
-                    log(f"[CLAIM] CLAIMABLE! {current}/{required}s")
+                # ratio >= 1.0 means progress >= required
+                if required > 0 and ratio >= 1.0:
+                    log(f"[CLAIM] CLAIMABLE! {total_progress}/{required}s (ratio={ratio})")
                     result = claim_reward(campaign_id, reward_id)
                     if result:
                         claimed_any = True
-                        tg_send(f"<b>REWARD CLAIMED!</b>\nStreamer: @{username or '?'}\nReward: {reward_id[:16]}...", chat_id=ADMIN_ID)
+                        tg_send(f"<b>REWARD CLAIMED!</b>\nStreamer: @{username or '?'}\nCampaign: ATK Drop\nReward: {r.get('name', reward_id[:16])}", chat_id=ADMIN_ID)
                     if username:
                         try_claim_in_chat(username)
-                elif required > 0 and current > 0:
-                    remaining = required - current
-                    if remaining <= 300:
-                        log(f"[CLAIM] Almost ready: {current}/{required}s ({remaining}s left)")
+                elif required > 0 and ratio > 0:
+                    remaining_secs = required - total_progress
+                    pct = int(ratio * 100)
+                    if remaining_secs <= 300:
+                        log(f"[CLAIM] Almost ready: {total_progress}/{required}s ({pct}%, {remaining_secs:.0f}s left)")
         return claimed_any
-    except: return False
+    except Exception as e:
+        log(f"[CLAIM] Check error: {e}")
+        return False
 
 async def send_user_event(ws, channel_id, livestream_id):
     event = {"type": "user_event", "data": {"message": {
@@ -662,10 +676,11 @@ class SingleStreamWatcher:
             except: pass
             await send_user_event(ws, channel_id, livestream_id)
             with self._lock: self.events_sent += 1
-            log(f"[WATCH] Connected @{username}")
+            log(f"[WATCH] Connected @{username} channel_id={channel_id} livestream_id={livestream_id}")
             last_ue = time.time()
             last_ping = time.time()
             last_alive = time.time()
+            last_refresh = time.time()
             watch_start = time.time()
             while not self.stop_event.is_set():
                 now = time.time()
@@ -686,6 +701,16 @@ class SingleStreamWatcher:
                     if elapsed_since_start >= 60:
                         smart_claim_check(username)
                     log(f"[WATCH] event #{self.events_sent} @{username} ({fmt_duration(self.watch_time)})")
+                if now - last_refresh >= 300:
+                    last_refresh = now
+                    try:
+                        info = get_channel_info(username)
+                        if info and info.get("livestream_id"):
+                            if info["livestream_id"] != livestream_id:
+                                livestream_id = info["livestream_id"]
+                                self.livestream_id = livestream_id
+                                log(f"[WATCH] Updated livestream_id={livestream_id} for @{username}")
+                    except: pass
                 if now - last_alive >= 300:
                     last_alive = now
                     info = get_channel_info(username)
@@ -766,15 +791,18 @@ class ParallelWatcher:
 
     def _run(self):
         log("[PW] Parallel watcher started")
+        followed_on_startup = False
         while not self.stop_event.is_set():
             try:
                 all_streamers = set()
                 campaigns, _ = fetch_campaigns()
 
-                # Follow yesterday's drop streamers
-                if campaigns:
+                # Follow drop streamers (once on startup only)
+                if campaigns and not followed_on_startup:
                     follow_drop_streamers(campaigns)
+                    followed_on_startup = True
 
+                # Source 1: Active campaign channels
                 if campaigns:
                     for c in campaigns:
                         if is_stake_drop(c) and c.get("status") == "active":
@@ -782,26 +810,34 @@ class ParallelWatcher:
                                 username = ch.get("slug") or ch.get("user", {}).get("username")
                                 if username: all_streamers.add(username)
 
-                followed = get_followed_streamers()
-                for u in followed: all_streamers.add(u)
+                # Source 2: All followed streamers (not just campaigns)
+                try:
+                    followed = get_followed_streamers()
+                    for u in followed: all_streamers.add(u)
+                except: pass
 
-                # Fallback: Slots & Casino category
-                if not all_streamers:
-                    log("[PW] No Stake streamers, checking Slots & Casino...")
+                # Source 3: Slots & Casino category (ALWAYS check, not just fallback)
+                try:
                     slots = get_slots_streamers()
                     for s in slots:
-                        if s["username"]: all_streamers.add(s["username"])
+                        if s.get("username"): all_streamers.add(s["username"])
+                except: pass
 
                 if not all_streamers:
-                    log("[PW] No streamers found, waiting 30s...")
+                    log("[PW] No streamers found from any source, waiting 30s...")
                     time.sleep(30)
                     continue
 
+                log(f"[PW] Checking {len(all_streamers)} streamers for live status...")
+
+                # Check which are live
                 live_streamers = []
-                for username in all_streamers:
+                for username in list(all_streamers):
                     if self.stop_event.is_set(): break
+                    if username in self.watchers: continue
                     info = get_channel_info(username)
                     if info and info.get("is_live"):
+                        info["username"] = username
                         live_streamers.append(info)
                     time.sleep(0.2)
 
@@ -810,10 +846,13 @@ class ParallelWatcher:
                     time.sleep(30)
                     continue
 
-                log(f"[PW] Found {len(live_streamers)} live streamers")
+                log(f"[PW] Found {len(live_streamers)} LIVE streamers | Watching: {len(self.watchers)}")
 
+                # Start watching live streamers (max 7 concurrent)
+                MAX_CONCURRENT = 7
                 for streamer in live_streamers:
                     if self.stop_event.is_set(): break
+                    if len(self.watchers) >= MAX_CONCURRENT: break
                     username = streamer["username"]
                     if username in self.watchers: continue
                     watch_min = random.randint(3, 15)
@@ -830,7 +869,7 @@ class ParallelWatcher:
                     log(f"[PW] Started @{username} for {watch_min} min")
                     tg_send(f"<b>PW:</b> Watching @{username} ({watch_min} min)")
 
-                # Smart claim check (not every 30s, only when progress exists)
+                # Smart claim check after starting watchers
                 smart_claim_check()
 
                 time.sleep(30)
@@ -883,10 +922,11 @@ class StreamWatcher:
             try: await asyncio.wait_for(ws.recv(), timeout=5)
             except: pass
             await send_user_event(ws, channel_id, livestream_id)
-            log(f"[SW] Connected @{username}")
+            log(f"[SW] Connected @{username} channel_id={channel_id} livestream_id={livestream_id}")
             start = time.time()
             last_ue = time.time()
             last_ping = time.time()
+            last_refresh = time.time()
             ev_count = 1
             while not self.stop_event.is_set():
                 now = time.time()
@@ -907,6 +947,16 @@ class StreamWatcher:
                     last_ue = now
                     remaining = int(self.target_seconds - elapsed)
                     log(f"[SW] event #{ev_count} @{username} ({remaining}s left)")
+                if now - last_refresh >= 300:
+                    last_refresh = now
+                    try:
+                        info = get_channel_info(username)
+                        if info and info.get("livestream_id"):
+                            if info["livestream_id"] != livestream_id:
+                                livestream_id = info["livestream_id"]
+                                self.livestream_id = livestream_id
+                                log(f"[SW] Updated livestream_id={livestream_id} for @{username}")
+                    except: pass
                 if ev_count % 5 == 0:
                     info = get_channel_info(username)
                     if not info or not info.get("is_live"):
