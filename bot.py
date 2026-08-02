@@ -1623,7 +1623,9 @@ class DropHunter:
         self.known_campaigns = {}  # cid -> status
         self.known_all_channels = set()  # ALL channels ever seen in campaigns
         self.user_pref_channels = set()  # User preference channels (no time limit)
-        self.claim_retry_queue = {}  # claim_key -> {campaign_id, reward_id, slug, retries, next_retry}
+        self.claim_retry_queue = {}  # claim_key -> {campaign_id, reward_id, slug, retries, next_retry, last_progress}
+        self.failed_rewards = set()  # permanently failed - don't re-add to retry queue
+        self.known_stake_campaigns = set()  # IDs of confirmed Stake drops only
         self._lock = threading.Lock()
     
     def start(self):
@@ -1656,7 +1658,8 @@ class DropHunter:
                             to_remove.append(key)
                     for key in to_remove:
                         self.claim_retry_queue.pop(key, None)
-                        log(f"[DH] Retry expired: {key}")
+                        self.failed_rewards.add(key)
+                        log(f"[DH] Retry expired (gave up): {key}")
                 
                 for key, info in to_retry:
                     campaign_id = info.get("campaign_id")
@@ -1687,6 +1690,14 @@ class DropHunter:
                                                 info["retries"] = info.get("retries", 0) + 1
                                                 info["next_retry"] = now + 3
                                         else:
+                                            last_progress = info.get("last_progress", ratio)
+                                            if abs(ratio - last_progress) < 0.01 and info.get("retries", 0) > 30:
+                                                with self._lock:
+                                                    self.claim_retry_queue.pop(key, None)
+                                                    self.failed_rewards.add(key)
+                                                log(f"[DH] Progress STUCK at {ratio:.2f} for {key} - gave up (user_event not tracking)")
+                                                break
+                                            info["last_progress"] = ratio
                                             info["retries"] = info.get("retries", 0) + 1
                                             info["next_retry"] = now + 3
                                             log(f"[DH] Retry {info['retries']}: {key} (progress={ratio:.2f})")
@@ -1956,10 +1967,15 @@ class DropHunter:
             old_status = self.known_campaigns.get(cid)
             self.known_campaigns[cid] = status
             
-            # Handle active drops - AGGRESSIVE CLAIM
+            # Handle active drops - AGGRESSIVE CLAIM (ONLY Stake drops with 2-min window)
             if status == "active" and old_status != "active":
-                log(f"[DH] NEW ACTIVE: {name}")
-                tg_send(f"<b>DROP ACTIVE!</b>\n<b>{name}</b>\nClaim window: {fmt_countdown(end_at)}\nRetrying every 3s...", chat_id=ADMIN_ID)
+                if not is_stake_drop(c):
+                    log(f"[DH] Non-Stake active: {name} - skipping claim (watch only)")
+                    continue
+                
+                self.known_stake_campaigns.add(cid)
+                log(f"[DH] NEW ACTIVE STAKE DROP: {name}")
+                tg_send(f"<b>🎯 STAKE DROP ACTIVE!</b>\n<b>{name}</b>\nClaim window: {fmt_countdown(end_at)}\nClaiming...", chat_id=ADMIN_ID)
                 
                 for ch in channels:
                     slug = ch.get("slug") or (ch.get("user") or {}).get("username", "")
@@ -1995,8 +2011,15 @@ class DropHunter:
                                 }
                             log(f"[DH] Queued for retry: {r.get('name', '?')} @ {slug}")
             
-            # Handle ALL upcoming drops - START WATCHING IMMEDIATELY (not 15 min before)
+            # Handle upcoming Stake drops - notify + PRE-WATCH immediately
             if start_at and status == "upcoming":
+                if is_stake_drop(c):
+                    self.known_stake_campaigns.add(cid)
+                    # Notify ONCE about upcoming Stake drops
+                    notify_key = f"upcoming_{cid}"
+                    if notify_key not in self.claimed_rewards:
+                        self.claimed_rewards.add(notify_key)
+                        tg_send(f"<b>🎯 STAKE DROP SOON!</b>\n<b>{name}</b>\nStarts: {fmt_countdown(start_at)}\nPre-watching channels now...", chat_id=ADMIN_ID)
                 try:
                     start_time = datetime.fromisoformat(start_at.replace("Z", "+00:00"))
                     now = datetime.now(start_time.tzinfo) if start_time.tzinfo else datetime.now()
@@ -2043,11 +2066,12 @@ class DropHunter:
                     time.sleep(0.3)
             self._check_idx = (check_start + 3) % len(known_list)
         
-        # Re-check ALL progress for unclaimed rewards
+        # Re-check ALL progress for unclaimed rewards (ONLY Stake campaigns)
         try:
             progress = fetch_progress()
             for p in progress:
                 cid = p.get("id") or p.get("campaign_id", "")
+                if cid not in self.known_stake_campaigns: continue  # Skip non-Stake campaigns
                 total = p.get("progress_units", 0)
                 for r in p.get("rewards", []):
                     if r.get("claimed"): continue
@@ -2057,6 +2081,7 @@ class DropHunter:
                     claim_key = f"{cid}_{reward_id}"
                     
                     if claim_key in self.claimed_rewards: continue
+                    if claim_key in self.failed_rewards: continue
                     
                     # If progress complete, claim immediately
                     if ratio >= 1.0 or total >= required:
