@@ -433,7 +433,14 @@ def validate_cookie_and_get_user(cookie):
         log(f"[COOKIE] Validation error: {e}")
         return False, None, None
 
+_progress_cache = {"data": None, "ts": 0}
+
 def fetch_progress():
+    global _progress_cache
+    now = time.time()
+    # Cache for 5 seconds to avoid 403 rate limits
+    if _progress_cache["data"] is not None and now - _progress_cache["ts"] < 5:
+        return _progress_cache["data"]
     try:
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + get_cookie()
@@ -442,13 +449,15 @@ def fetch_progress():
         req = urllib.request.Request(PROGRESS_API)
         for k, v in headers.items(): req.add_header(k, v)
         resp = urllib.request.urlopen(req, timeout=15)
-        return json.loads(resp.read().decode()).get("data", [])
+        data = json.loads(resp.read().decode()).get("data", [])
+        _progress_cache = {"data": data, "ts": now}
+        return data
     except urllib.error.HTTPError as e:
         log(f"[PROGRESS] HTTP {e.code}: {e.read().decode()[:200] if e.fp else ''}")
-        return []
+        return _progress_cache["data"] or []
     except Exception as e:
         log(f"[PROGRESS] Error: {e}")
-        return []
+        return _progress_cache["data"] or []
 
 def claim_reward(campaign_id, reward_id):
     try:
@@ -1661,18 +1670,28 @@ class DropHunter:
                         self.failed_rewards.add(key)
                         log(f"[DH] Retry expired (gave up): {key}")
                 
+                # Batch fetch progress ONCE for all retries
+                if to_retry:
+                    try:
+                        batch_progress = fetch_progress()
+                    except:
+                        batch_progress = []
+                else:
+                    batch_progress = []
+                
                 for key, info in to_retry:
                     campaign_id = info.get("campaign_id")
                     reward_id = info.get("reward_id")
                     slug = info.get("slug", "?")
                     
-                    # Check progress first
+                    # Check progress from batch
                     try:
-                        progress = fetch_progress()
-                        for p in progress:
+                        found = False
+                        for p in batch_progress:
                             if str(p.get("id", "")) == str(campaign_id) or str(p.get("campaign_id", "")) == str(campaign_id):
                                 for r in p.get("rewards", []):
                                     if str(r.get("id", "")) == str(reward_id) or str(r.get("reward_id", "")) == str(reward_id):
+                                        found = True
                                         if r.get("claimed"): 
                                             with self._lock: self.claim_retry_queue.pop(key, None)
                                             log(f"[DH] Already claimed: {key}")
@@ -1688,20 +1707,27 @@ class DropHunter:
                                                 tg_send(f"<b>CLAIMED!</b>\n@{slug}\nReward: {reward_id[:20]}", chat_id=ADMIN_ID)
                                             else:
                                                 info["retries"] = info.get("retries", 0) + 1
-                                                info["next_retry"] = now + 3
+                                                info["next_retry"] = now + 10
                                         else:
                                             last_progress = info.get("last_progress", ratio)
-                                            if abs(ratio - last_progress) < 0.01 and info.get("retries", 0) > 30:
+                                            # Progress stuck for >5 retries (15s) = give up
+                                            if abs(ratio - last_progress) < 0.01 and info.get("retries", 0) > 5:
                                                 with self._lock:
                                                     self.claim_retry_queue.pop(key, None)
                                                     self.failed_rewards.add(key)
-                                                log(f"[DH] Progress STUCK at {ratio:.2f} for {key} - gave up (user_event not tracking)")
+                                                log(f"[DH] Progress STUCK at {ratio:.2f} for {key} - gave up")
                                                 break
                                             info["last_progress"] = ratio
                                             info["retries"] = info.get("retries", 0) + 1
-                                            info["next_retry"] = now + 3
+                                            info["next_retry"] = now + 10
                                             log(f"[DH] Retry {info['retries']}: {key} (progress={ratio:.2f})")
                                         break
+                        if not found:
+                            # Campaign not found in progress = not tracking, give up
+                            with self._lock:
+                                self.claim_retry_queue.pop(key, None)
+                                self.failed_rewards.add(key)
+                            log(f"[DH] No progress data for {key} - gave up")
                     except Exception as e:
                         log(f"[DH] Retry check error for {key}: {e}")
                     
@@ -1991,6 +2017,7 @@ class DropHunter:
                         reward_id = r.get("id", "")
                         claim_key = f"{cid}_{reward_id}"
                         if claim_key in self.claimed_rewards: continue
+                        if claim_key in self.failed_rewards: continue
                         
                         # Try immediate claim
                         result = claim_reward(cid, reward_id)
@@ -1999,17 +2026,9 @@ class DropHunter:
                             log(f"[DH] CLAIMED: {r.get('name', '?')}")
                             tg_send(f"<b>CLAIMED!</b>\n{name}\n{r.get('name', '?')}\n@{slug}", chat_id=ADMIN_ID)
                         else:
-                            # Add to aggressive retry queue
-                            with self._lock:
-                                self.claim_retry_queue[claim_key] = {
-                                    "campaign_id": cid,
-                                    "reward_id": reward_id,
-                                    "slug": slug,
-                                    "retries": 0,
-                                    "next_retry": time.time() + 3,
-                                    "started_at": time.time(),
-                                }
-                            log(f"[DH] Queued for retry: {r.get('name', '?')} @ {slug}")
+                            # INVALID_CLAIM = requirements not met, don't retry
+                            self.failed_rewards.add(claim_key)
+                            log(f"[DH] Claim failed (requirements not met): {r.get('name', '?')} @ {slug}")
             
             # Handle upcoming Stake drops - notify + PRE-WATCH immediately
             if start_at and status == "upcoming":
