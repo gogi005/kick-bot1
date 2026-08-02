@@ -1,11 +1,14 @@
 """
-Kick Stake Drops Bot v16
+Kick Stake Drops Bot v19 - ALWAYS-ON PRE-WATCH + AGGRESSIVE CLAIM
+- 24/7 Pre-Watch: watch ALL known drop channels continuously
+- Aggressive Claim Retry: retry every 3s for 5 min after drop activates
+- Extended Pre-Watch: watch upcoming channels IMMEDIATELY (not 15 min before)
+- Smart Channel Pool: all active/upcoming/expired + followed + slots
+- Faster polling: 2s interval for quicker detection
 - Parallel watcher: all live streams simultaneously
-- Smart claim: only check when claim window open (no API spam)
 - Category fallback: Slots & Casino if no Stake streamers
 - Follow streamers on watch + follow yesterday's drop streamers
 - Password-protected dashboard + logs page
-- Fixed follow API: POST kick.com/api/v2/channels/{slug}/follow
 """
 import urllib.request, json, time, os, threading, random, hashlib
 import asyncio
@@ -13,13 +16,25 @@ import websockets
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# Supabase database module (persistent storage)
+try:
+    import supabase_db as db
+    USE_SUPABASE = True
+    print("[INIT] Using Supabase database for storage")
+except Exception as e:
+    USE_SUPABASE = False
+    print(f"[INIT] Supabase unavailable, using JSON files: {e}")
+
 # ============ CONFIG ============
 TG_TOKEN = os.environ.get("TG_TOKEN", "8860462138:AAGkQQF1c-MyTfD3-3WluZNMarcT7HLj4dg")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8182391939"))
 INITIAL_COOKIE = os.environ.get("KICK_COOKIE", "365875656%7C3qeqtSAxow2mU2adRmgluNijBSImYcgoLFRIZ2v9")
 DASH_USER = os.environ.get("DASH_USER", "admin")
 DASH_PASS = os.environ.get("DASH_PASS", "kickbot2026")
-POLL_INTERVAL = 5
+POLL_INTERVAL = 2
+AUTO_WATCH_LIMIT = 1800  # 30 minutes for Stake drop list
+USER_PREF_LIMIT = None  # No limit for user preferences - watch until stopped/offline
+MAX_PARALLEL_STREAMS = 10  # Max parallel streams in auto mode
 DROPS_API = "https://web.kick.com/api/v1/drops/campaigns"
 PROGRESS_API = "https://web.kick.com/api/v1/drops/progress"
 CLAIM_API = "https://web.kick.com/api/v1/drops/claim"
@@ -41,6 +56,7 @@ RR_STATE_FILE = "tg_roundrobin_state.json"
 HISTORY_FILE = "tg_drop_history.json"
 LOG_FILE = "tg_bot_logs.json"
 FOLLOWED_CACHE_FILE = "tg_followed_cache.json"
+WATCHLIST_FILE = "tg_watchlist.json"  # Manual channel watchlist (persistent)
 DASHBOARD_PORT = int(os.environ.get("PORT", "8080"))
 KEEPER_INTERVAL = 1800
 SLOTS_CATEGORY_ID = None
@@ -57,6 +73,7 @@ BASE_HEADERS = {
 LOG_BUFFER = []
 LOG_LOCK = threading.Lock()
 MAX_LOG_BUFFER = 500
+_LOG_SAVE_TIMER = 0  # Debounce: only save logs every 30 seconds
 
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -69,14 +86,30 @@ def log(msg):
     _save_logs()
 
 def _save_logs():
+    global _LOG_SAVE_TIMER
     try:
+        now = time.time()
+        if USE_SUPABASE and now - _LOG_SAVE_TIMER < 30:
+            return  # Debounce: skip if saved recently
+        _LOG_SAVE_TIMER = now
         with LOG_LOCK:
-            logs = list(LOG_BUFFER[-200:])
+            logs_data = list(LOG_BUFFER[-200:])
+        if USE_SUPABASE:
+            try:
+                db.save_logs(logs_data)
+                return
+            except Exception as e:
+                print(f"[DB] _save_logs fallback: {e}")
         with open(LOG_FILE, "w") as f:
-            json.dump(logs, f)
+            json.dump(logs_data, f)
     except: pass
 
 def load_logs():
+    if USE_SUPABASE:
+        try:
+            return db.load_logs()
+        except Exception as e:
+            print(f"[DB] load_logs fallback: {e}")
     if os.path.exists(LOG_FILE):
         try:
             with open(LOG_FILE) as f: return json.load(f)
@@ -84,50 +117,92 @@ def load_logs():
     return []
 
 # ---- Cookie ----
-def get_cookie():
+def get_cookie(user_id=None):
+    """Get cookie - user-specific if available, else global"""
+    # Try user-specific cookie first
+    if user_id and USE_SUPABASE:
+        try:
+            user_data = db.get_user_cookie(user_id)
+            if user_data and user_data.get("cookie"):
+                return user_data["cookie"]
+        except Exception as e:
+            print(f"[DB] get_user_cookie error: {e}")
+    
+    # Try global cookie from Supabase
+    if USE_SUPABASE:
+        try:
+            c = db.load_cookie_db()
+            if c: return c
+        except Exception as e:
+            print(f"[DB] get_cookie fallback: {e}")
+    
+    # Try local file
     if os.path.exists(COOKIE_FILE):
         try:
             with open(COOKIE_FILE) as f:
                 c = json.load(f).get("cookie", "")
                 if c: return c
         except: pass
+    
     return INITIAL_COOKIE
 
 def save_cookie(cookie):
+    if USE_SUPABASE:
+        try:
+            db.save_cookie_db(cookie)
+            return
+        except Exception as e:
+            print(f"[DB] save_cookie fallback: {e}")
     with open(COOKIE_FILE, "w") as f:
         json.dump({"cookie": cookie, "time": datetime.now().isoformat()}, f)
 
-# ---- Session Keeper ----
+# ---- Session Keeper (HTTP-based, no browser needed) ----
 def session_keeper():
-    log("Session keeper started")
+    """Keep session alive by making a simple HTTP request to Kick.
+    No browser/Playwright needed - just an HTTP request with the cookie."""
+    log("Session keeper started (HTTP-based)")
     while True:
         try:
-            from playwright.sync_api import sync_playwright
             cookie = get_cookie()
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                ctx = browser.new_context(user_agent="Mozilla/5.0")
-                ctx.add_cookies([{"name": "session", "value": cookie, "domain": ".kick.com", "path": "/"}])
-                page = ctx.new_page()
-                for url in ["https://kick.com/", "https://kick.com/drops/all-campaigns"]:
-                    try:
-                        page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                        time.sleep(2)
-                    except: pass
-                new_cookie = None
-                for c in ctx.cookies():
-                    if c["name"] == "session":
-                        new_cookie = c["value"]; break
-                browser.close()
-                if new_cookie:
-                    save_cookie(new_cookie)
-                    log(f"Cookie refreshed ({len(new_cookie)} chars)")
+            if not cookie:
+                log("[KEEPER] No cookie to refresh")
+                time.sleep(KEEPER_INTERVAL)
+                continue
+            
+            # Simple HTTP request to keep session alive
+            headers = dict(BASE_HEADERS)
+            headers["Cookie"] = "session=" + cookie
+            
+            # Hit kick.com to refresh session
+            req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
+            resp = urllib.request.urlopen(req, timeout=15)
+            data = json.loads(resp.read().decode())
+            
+            if data.get("username"):
+                log(f"[KEEPER] Session alive - @{data['username']}")
+            
+            # Also check drops page to keep that session fresh
+            try:
+                req2 = urllib.request.Request(DROPS_API, headers=headers)
+                urllib.request.urlopen(req2, timeout=10)
+            except: pass
+            
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                log("[KEEPER] Cookie expired! Use /setcookie to update")
+            else:
+                log(f"[KEEPER] HTTP {e.code}")
         except Exception as e:
-            log(f"Keeper error: {e}")
+            log(f"[KEEPER] Error: {str(e)[:80]}")
         time.sleep(KEEPER_INTERVAL)
 
 # ---- Subscribers ----
 def load_subs():
+    if USE_SUPABASE:
+        try:
+            return db.load_subs()
+        except Exception as e:
+            print(f"[DB] load_subs fallback: {e}")
     if os.path.exists(SUBS_FILE):
         try:
             with open(SUBS_FILE) as f: return json.load(f)
@@ -135,7 +210,14 @@ def load_subs():
     return {}
 
 def save_subs(subs):
+    if USE_SUPABASE:
+        try:
+            db.save_subs(subs)
+            return
+        except Exception as e:
+            print(f"[DB] save_subs fallback: {e}")
     with open(SUBS_FILE, "w") as f: json.dump(subs, f, indent=2)
+    _git_commit("Subscribers updated")
 
 def add_sub(chat_id):
     subs = load_subs()
@@ -177,9 +259,9 @@ def tg_get_updates(offset=0):
     except: return []
 
 # ---- Kick API ----
-def kick_request(url, extra_headers=None, timeout=15):
+def kick_request(url, extra_headers=None, timeout=15, user_id=None):
     headers = dict(BASE_HEADERS)
-    cookie = get_cookie()
+    cookie = get_cookie(user_id)
     if cookie: headers["Cookie"] = "session=" + cookie
     headers["X-Client-Token"] = KICK_CLIENT_TOKEN
     if extra_headers: headers.update(extra_headers)
@@ -213,7 +295,9 @@ def get_channel_info(username):
     except: return None
 
 def follow_channel(username):
-    """Follow a channel on Kick - with 429 backoff"""
+    """Follow a channel on Kick - with 429 backoff.
+    NOTE: Kick uses Kasada bot detection, so follow often fails with 429.
+    This is expected - follow is not critical for drop claiming."""
     global FOLLOW_COOLDOWN
     if username in FOLLOW_COOLDOWN:
         if time.time() < FOLLOW_COOLDOWN[username]:
@@ -226,7 +310,8 @@ def follow_channel(username):
         if cookie: headers["Cookie"] = "session=" + cookie
         headers["Authorization"] = f"Bearer {get_session_token()}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-        req = urllib.request.Request(url, method="POST")
+        body = json.dumps({}).encode()
+        req = urllib.request.Request(url, data=body, method="POST")
         for k, v in headers.items(): req.add_header(k, v)
         resp = urllib.request.urlopen(req, timeout=10)
         log(f"[FOLLOW] OK @{username}")
@@ -237,8 +322,9 @@ def follow_channel(username):
             log(f"[FOLLOW] Already following @{username}")
             return True
         if e.code == 429:
-            FOLLOW_COOLDOWN[username] = time.time() + 300
-            log(f"[FOLLOW] Rate limited @{username}, cooldown 5min")
+            # Kasada bot detection - not real rate limit
+            FOLLOW_COOLDOWN[username] = time.time() + 600  # 10 min cooldown
+            log(f"[FOLLOW] Bot detected (429) @{username} - follow skipped (not critical)")
             return False
         log(f"[FOLLOW] HTTP {e.code} @{username}: {body}")
         return False
@@ -251,7 +337,12 @@ def get_followed_streamers():
         data = kick_request(FOLLOWED_API)
         channels = data.get("channels", [])
         return [ch.get("channel_slug") or ch.get("user_username") for ch in channels if ch.get("channel_slug")]
-    except: return []
+    except urllib.error.HTTPError as e:
+        log(f"[FOLLOWED] HTTP {e.code}: {e.read().decode()[:200] if e.fp else ''}")
+        return []
+    except Exception as e:
+        log(f"[FOLLOWED] Error: {e}")
+        return []
 
 def get_chatroom_id(username):
     try:
@@ -291,12 +382,47 @@ def get_ws_token(session_token):
         return data.get("data", {}).get("token")
     except: return None
 
-def get_session_token():
+def get_session_token(user_id=None):
     """Return decoded cookie as Bearer token - browser uses | not %7C"""
-    cookie = get_cookie()
+    cookie = get_cookie(user_id)
     if not cookie: return None
     import urllib.parse
     return urllib.parse.unquote(cookie)
+
+def validate_cookie_and_get_user(cookie):
+    """Validate cookie by fetching user data from Kick. Returns (valid, username, user_id)"""
+    try:
+        headers = dict(BASE_HEADERS)
+        headers["Cookie"] = "session=" + cookie
+        token = None
+        try:
+            import urllib.parse
+            token = urllib.parse.unquote(cookie)
+        except: pass
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+        
+        # Try to get user info from Kick
+        req = urllib.request.Request("https://kick.com/api/v2/users/me")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode())
+        
+        username = data.get("username") or data.get("slug")
+        user_id = data.get("id")
+        
+        if username:
+            log(f"[COOKIE] Valid! User: @{username} (ID: {user_id})")
+            return True, username, user_id
+        return False, None, None
+    except urllib.error.HTTPError as e:
+        log(f"[COOKIE] Validation failed: HTTP {e.code}")
+        return False, None, None
+    except Exception as e:
+        log(f"[COOKIE] Validation error: {e}")
+        return False, None, None
 
 def fetch_progress():
     try:
@@ -308,7 +434,12 @@ def fetch_progress():
         for k, v in headers.items(): req.add_header(k, v)
         resp = urllib.request.urlopen(req, timeout=15)
         return json.loads(resp.read().decode()).get("data", [])
-    except: return []
+    except urllib.error.HTTPError as e:
+        log(f"[PROGRESS] HTTP {e.code}: {e.read().decode()[:200] if e.fp else ''}")
+        return []
+    except Exception as e:
+        log(f"[PROGRESS] Error: {e}")
+        return []
 
 def claim_reward(campaign_id, reward_id):
     try:
@@ -460,6 +591,11 @@ def fmt_campaign(c):
 
 # ---- History ----
 def load_history():
+    if USE_SUPABASE:
+        try:
+            return db.load_history()
+        except Exception as e:
+            print(f"[DB] load_history fallback: {e}")
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE) as f: return json.load(f)
@@ -467,9 +603,21 @@ def load_history():
     return []
 
 def save_history(history):
+    if USE_SUPABASE:
+        try:
+            db.save_history(history)
+            return
+        except Exception as e:
+            print(f"[DB] save_history fallback: {e}")
     with open(HISTORY_FILE, "w") as f: json.dump(history, f, indent=2, default=str)
 
 def add_to_history(campaign, event_type="seen"):
+    if USE_SUPABASE:
+        try:
+            db.add_to_history_db(campaign, event_type)
+            return
+        except Exception as e:
+            print(f"[DB] add_to_history fallback: {e}")
     history = load_history()
     entry = {
         "id": campaign.get("id", "?"),
@@ -496,6 +644,92 @@ def load_followed_cache():
 def save_followed_cache(cache):
     with open(FOLLOWED_CACHE_FILE, "w") as f: json.dump(cache, f, indent=2)
 
+# ---- Manual Watchlist (Persistent) ----
+def load_watchlist():
+    """Load manually added channels."""
+    if USE_SUPABASE:
+        try:
+            return db.load_watchlist()
+        except Exception as e:
+            print(f"[DB] load_watchlist fallback: {e}")
+    if os.path.exists(WATCHLIST_FILE):
+        try:
+            with open(WATCHLIST_FILE) as f: return json.load(f)
+        except: pass
+    return {"channels": [], "added_by": {}, "last_updated": None}
+
+def save_watchlist(watchlist):
+    """Save watchlist."""
+    if USE_SUPABASE:
+        try:
+            db.save_watchlist(watchlist)
+            return
+        except Exception as e:
+            print(f"[DB] save_watchlist fallback: {e}")
+    watchlist["last_updated"] = datetime.now().isoformat()
+    with open(WATCHLIST_FILE, "w") as f: json.dump(watchlist, f, indent=2)
+    _git_commit("Watchlist updated")
+
+def _git_commit(message="Auto-save"):
+    """Commit changes to GitHub for persistent storage.
+    Skipped when using Supabase (not needed)."""
+    if USE_SUPABASE:
+        return  # Not needed - data is in Supabase
+    try:
+        import subprocess
+        subprocess.run(["git", "add", "*.json"], capture_output=True, timeout=10)
+        result = subprocess.run(
+            ["git", "commit", "-m", message],
+            capture_output=True, text=True, timeout=10
+        )
+        subprocess.run(["git", "push"], capture_output=True, timeout=30)
+        log(f"[GIT] Committed: {message}")
+    except: pass
+
+def add_to_watchlist(username, added_by="manual"):
+    """Add a channel to the persistent watchlist."""
+    if USE_SUPABASE:
+        try:
+            return db.add_to_watchlist_db(username, added_by)
+        except Exception as e:
+            print(f"[DB] add_to_watchlist fallback: {e}")
+    watchlist = load_watchlist()
+    username = username.lower().strip("@").strip()
+    if username not in watchlist["channels"]:
+        watchlist["channels"].append(username)
+        watchlist["added_by"][username] = {"by": added_by, "time": datetime.now().isoformat()}
+        save_watchlist(watchlist)
+        log(f"[WATCHLIST] Added @{username} by {added_by}")
+        return True, f"@{username} added to watchlist!"
+    return False, f"@{username} already in watchlist."
+
+def remove_from_watchlist(username):
+    """Remove a channel from the watchlist."""
+    if USE_SUPABASE:
+        try:
+            return db.remove_from_watchlist_db(username)
+        except Exception as e:
+            print(f"[DB] remove_from_watchlist fallback: {e}")
+    watchlist = load_watchlist()
+    username = username.lower().strip("@").strip()
+    if username in watchlist["channels"]:
+        watchlist["channels"].remove(username)
+        watchlist["added_by"].pop(username, None)
+        save_watchlist(watchlist)
+        log(f"[WATCHLIST] Removed @{username}")
+        return True, f"@{username} removed from watchlist!"
+    return False, f"@{username} not in watchlist."
+
+def get_watchlist():
+    """Get all channels in the watchlist."""
+    if USE_SUPABASE:
+        try:
+            return db.get_watchlist_db()
+        except Exception as e:
+            print(f"[DB] get_watchlist fallback: {e}")
+    watchlist = load_watchlist()
+    return watchlist.get("channels", [])
+
 def follow_drop_streamers(campaigns):
     """Follow all streamers from active Stake drops"""
     cache = load_followed_cache()
@@ -518,6 +752,11 @@ def follow_drop_streamers(campaigns):
 
 # ---- State ----
 def load_state():
+    if USE_SUPABASE:
+        try:
+            return db.load_state()
+        except Exception as e:
+            print(f"[DB] load_state fallback: {e}")
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE) as f: return json.load(f)
@@ -525,7 +764,14 @@ def load_state():
     return {"known": {}, "polls": 0, "last_poll": None}
 
 def save_state(state):
+    if USE_SUPABASE:
+        try:
+            db.save_state(state)
+            return
+        except Exception as e:
+            print(f"[DB] save_state fallback: {e}")
     with open(STATE_FILE, "w") as f: json.dump(state, f, indent=2, default=str)
+    _git_commit("State updated")
 
 # ============================================================
 #  SINGLE WATCHER
@@ -1017,12 +1263,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         w_list = ", ".join([f"@{u}" for u in watching]) or "None"
         sw_s = "ACTIVE" if single_watcher.active else "IDLE"
         sw_users = ", ".join([f"@{u}" for u in single_watcher.watchers.keys()]) or "None"
-        html = f"""<!DOCTYPE html><html><head><title>Kick Drops v15</title>
+        dh_s = "ACTIVE" if drop_hunter.active else "STOPPED"
+        dh_c = "#4CAF50" if drop_hunter.active else "#999"
+        dh_watching = len(drop_hunter.watching_channels)
+        dh_known = len(drop_hunter.known_all_channels)
+        dh_claimed = len(drop_hunter.claimed_rewards)
+        dh_retries = len(drop_hunter.claim_retry_queue)
+        # User cookies section
+        user_cookies_html = ""
+        if USE_SUPABASE:
+            try:
+                user_cookies = db.get_all_user_cookies()
+                if user_cookies:
+                    user_cookies_html = "<div class='c'><h2>User Cookies</h2><table><tr><th>TG ID</th><th>Kick Username</th><th>Kick User ID</th><th>Last Used</th></tr>"
+                    for uc in user_cookies:
+                        last_used = uc.get('last_used', '?')[:16] if uc.get('last_used') else '?'
+                        user_cookies_html += f"<tr><td>{uc.get('user_id', '?')}</td><td>@{uc.get('kick_username', '?')}</td><td>{uc.get('kick_user_id', '?')}</td><td>{last_used}</td></tr>"
+                    user_cookies_html += "</table></div>"
+            except: pass
+        
+        html = f"""<!DOCTYPE html><html><head><title>Kick Drops v19 - Always-On</title>
 <meta http-equiv="refresh" content="30">
 <style>body{{font-family:Arial;background:#1a1a2e;color:#eee;padding:20px}}h1{{color:#e94560}}.c{{background:#16213e;padding:20px;border-radius:10px;margin:10px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;text-align:left;border-bottom:1px solid #333}}th{{background:#0f3460}}a{{color:#e94560}}</style></head><body>
-<h1>Kick Stake Drops Bot v15</h1>
+<h1>Kick Stake Drops Bot v19 - Always-On Pre-Watch</h1>
 <p><a href="/logs">View Logs</a></p>
 <div class="c"><h2>Status</h2><p>Polls: {state.get('polls',0)}</p><p>Last: {state.get('last_poll','never')}</p></div>
+<div class="c"><h2>Drop Hunter v3 (Always-On)</h2><p style='color:{dh_c};font-size:1.2em'><b>{dh_s}</b></p><p>Watching: {dh_watching} channels</p><p>Known: {dh_known} channels</p><p>Claimed: {dh_claimed}</p><p>Pending retries: {dh_retries}</p></div>
+{user_cookies_html}
 <div class="c"><h2>Parallel Watcher</h2><p style='color:{pw_c};font-size:1.2em'><b>{pw_s}</b></p><p>Watching: {w_list}</p><p>Watched: {pw.state.get('total_watched',0)}</p><p>Claimed: {pw.state.get('rewards_claimed',0)}</p></div>
 <div class="c"><h2>Single Watcher</h2><p><b>{sw_s}</b></p><p>{sw_users}</p></div>
 <div class="c"><h2>Users ({active}/{len(subs)})</h2><table><tr><th>ID</th><th>Status</th><th>Joined</th></tr>{rows}</table></div>
@@ -1063,24 +1330,31 @@ def handle_command(cmd, chat_id, text=""):
         if cmd == "/start" and is_new:
             tg_send_admin(f"NEW USER: {chat_id}\nTotal: {len(get_active_subs())}")
         tg_send(
-            "<b>Kick Stake Drops Bot v15</b>\n\n"
-            "<b>DROP COMMANDS:</b>\n"
+            "<b>Kick Drops Bot v19</b>\n\n"
+            "<b>DROP HUNTER (auto):</b>\n"
+            "/dh - Drop Hunter status\n"
+            "/dhretry - Claim retry queue\n\n"
+            "<b>WATCHLIST (Stake Drops):</b>\n"
+            "/addchannel &lt;user&gt; - Add channel to watch 24/7\n"
+            "/removechannel &lt;user&gt; - Remove from watchlist\n"
+            "/channels - List all watchlist channels\n\n"
+            "<b>MY STREAMERS (Custom):</b>\n"
+            "/addstreamer &lt;user&gt; - Add your favorite streamer\n"
+            "/removestreamer &lt;user&gt; - Remove from your list\n"
+            "/mystreamers - See your watch list\n"
+            "/mystreamersclear - Clear your list\n\n"
+            "<b>COMMANDS:</b>\n"
             "/all - All campaigns\n"
             "/stake - Stake campaigns\n"
             "/live - Live streams\n"
             "/history - Drop history\n"
             "/status - Bot status\n\n"
-            "<b>PARALLEL WATCHER:</b>\n"
-            "/watchround - Watch ALL live streams\n"
-            "/watchroundstop - Stop\n"
-            "/watchroundstatus - Status\n\n"
-            "<b>SINGLE WATCHER:</b>\n"
-            "/watchtest &lt;user1&gt; [user2] - Watch specific streams\n"
-            "/watchstop - Stop all\n"
+            "<b>MANUAL WATCH:</b>\n"
+            "/watchtest &lt;user1&gt; [user2] - Watch streams\n"
+            "/watchstop - Stop\n"
             "/watchstatus - Watch info\n\n"
             "<b>CONFIG:</b>\n"
             "/setcookie - Update cookie\n"
-            "/testchat &lt;user&gt; - Test chat\n"
             "/stop - Unsubscribe\n"
             "/help - This",
             chat_id=chat_id)
@@ -1088,6 +1362,31 @@ def handle_command(cmd, chat_id, text=""):
     elif cmd == "/stop":
         remove_sub(chat_id)
         tg_send("Unsubscribed.", chat_id=chat_id)
+
+    elif cmd == "/dh":
+        watching = drop_hunter.watching_channels
+        claimed = drop_hunter.claimed_rewards
+        known = drop_hunter.known_all_channels
+        retries = drop_hunter.claim_retry_queue
+        status = "ACTIVE" if drop_hunter.active else "STOPPED"
+        msg = f"<b>DROP HUNTER v3: {status}</b>\n\n"
+        msg += f"Watching: {len(watching)} channels\n"
+        msg += f"Known channels: {len(known)}\n"
+        msg += f"Claimed: {len(claimed)}\n"
+        msg += f"Pending retries: {len(retries)}\n"
+        if watching:
+            msg += f"\n<b>Watching:</b>\n"
+            for slug, info in list(watching.items())[:15]:
+                elapsed = int(time.time() - info.get("started_at", time.time()))
+                events = info.get("events_sent", 0)
+                msg += f"  @{slug}: {fmt_duration(elapsed)} | {events} ev\n"
+            if len(watching) > 15:
+                msg += f"  ... +{len(watching)-15} more\n"
+        tg_send(msg, chat_id=chat_id)
+
+    elif cmd == "/dhretry":
+        msg = drop_hunter.get_retry_status()
+        tg_send(msg, chat_id=chat_id)
 
     elif cmd == "/all":
         campaigns, _ = fetch_campaigns()
@@ -1145,9 +1444,65 @@ def handle_command(cmd, chat_id, text=""):
 
     elif cmd == "/setcookie":
         parts = text.split(maxsplit=1)
-        if len(parts) < 2: tg_send("Usage: /setcookie &lt;cookie&gt;", chat_id=chat_id); return
-        save_cookie(parts[1].strip())
-        tg_send("Cookie updated!", chat_id=chat_id)
+        if len(parts) < 2:
+            tg_send("Usage: /setcookie &lt;cookie&gt;\n\nKick se cookie paste karo.\nBot validate karega aur tumhara username fetch karega.", chat_id=chat_id)
+            return
+        
+        cookie = parts[1].strip()
+        tg_send("Validating cookie...", chat_id=chat_id)
+        
+        # Validate cookie and get user info
+        valid, username, user_id = validate_cookie_and_get_user(cookie)
+        
+        if valid and username:
+            # Save per-user cookie
+            if USE_SUPABASE:
+                db.save_user_cookie(chat_id, cookie, username, user_id)
+            
+            # Also save as global fallback
+            save_cookie(cookie)
+            
+            msg = (f"<b>Cookie Saved!</b>\n\n"
+                   f"<b>Kick Username:</b> @{username}\n"
+                   f"<b>Kick User ID:</b> {user_id}\n"
+                   f"<b>Your TG ID:</b> {chat_id}\n\n"
+                   f"Ab tumhare liye yeh cookie use hogi.\n"
+                   f"Bot automatically drops claim karega.")
+            tg_send(msg, chat_id=chat_id)
+            tg_send_admin(f"<b>NEW COOKIE SET!</b>\nUser: @{username} (ID: {user_id})\nTG: {chat_id}")
+        else:
+            # Invalid cookie - save as global fallback
+            save_cookie(cookie)
+            tg_send("Cookie saved (validation failed - using as global fallback).\nAgar yeh cookie valid hai toh baad mein kaam karegi.", chat_id=chat_id)
+
+    elif cmd == "/addchannel":
+        parts = text.split()
+        if len(parts) < 2: tg_send("Usage: /addchannel &lt;username&gt;\nExample: /addchannel stake", chat_id=chat_id); return
+        username = parts[1].strip("@").strip()
+        success, msg = add_to_watchlist(username, added_by=str(chat_id))
+        tg_send(msg, chat_id=chat_id)
+        if success:
+            tg_send_admin(f"<b>WATCHLIST:</b> @{username} added by {chat_id}")
+
+    elif cmd == "/removechannel":
+        parts = text.split()
+        if len(parts) < 2: tg_send("Usage: /removechannel &lt;username&gt;", chat_id=chat_id); return
+        username = parts[1].strip("@").strip()
+        success, msg = remove_from_watchlist(username)
+        tg_send(msg, chat_id=chat_id)
+
+    elif cmd == "/channels":
+        watchlist = get_watchlist()
+        if not watchlist:
+            tg_send("Watchlist is empty.\nUse /addchannel to add channels.", chat_id=chat_id)
+        else:
+            msg = f"<b>WATCHLIST ({len(watchlist)} channels):</b>\n\n"
+            for ch in watchlist:
+                info = get_channel_info(ch)
+                status = "🟢 LIVE" if info and info.get("is_live") else "⚫ offline"
+                msg += f"  @{ch} - {status}\n"
+            msg += "\nUse /addchannel or /removechannel"
+            tg_send(msg, chat_id=chat_id)
 
     elif cmd == "/testchat":
         parts = text.split()
@@ -1187,56 +1542,571 @@ def handle_command(cmd, chat_id, text=""):
     elif cmd == "/watchstatus":
         tg_send(single_watcher.get_status(), chat_id=chat_id)
 
+    # ---- User Preferences (Custom Streamers) ----
+    elif cmd == "/addstreamer":
+        parts = text.split()
+        if len(parts) < 2:
+            tg_send("Usage: /addstreamer &lt;username&gt;\n\nApne manpasand streamer add karo.\nJab tak woh live hai aur tum band na karo, bot watch karega.", chat_id=chat_id)
+            return
+        username = parts[1].strip("@").strip()
+        if USE_SUPABASE:
+            success, msg = db.add_user_preference(chat_id, username)
+            tg_send(msg, chat_id=chat_id)
+            if success:
+                tg_send_admin(f"<b>USER PREFERENCE:</b> @{username} added by {chat_id}")
+        else:
+            tg_send("User preferences require Supabase database.", chat_id=chat_id)
+
+    elif cmd == "/removestreamer":
+        parts = text.split()
+        if len(parts) < 2:
+            tg_send("Usage: /removestreamer &lt;username&gt;", chat_id=chat_id)
+            return
+        username = parts[1].strip("@").strip()
+        if USE_SUPABASE:
+            success, msg = db.remove_user_preference(chat_id, username)
+            tg_send(msg, chat_id=chat_id)
+        else:
+            tg_send("User preferences require Supabase database.", chat_id=chat_id)
+
+    elif cmd == "/mystreamers":
+        if not USE_SUPABASE:
+            tg_send("User preferences require Supabase database.", chat_id=chat_id)
+            return
+        prefs = db.get_user_preferences(chat_id)
+        if not prefs:
+            tg_send("Your watch list is empty.\n\nUse /addstreamer &lt;username&gt; to add streamers.", chat_id=chat_id)
+            return
+        msg = f"<b>Your Watch List ({len(prefs)}):</b>\n\n"
+        for ch in prefs:
+            info = get_channel_info(ch)
+            status = "LIVE" if info and info.get("is_live") else "offline"
+            color = "#4CAF50" if status == "LIVE" else "#999"
+            msg += f"  @{ch} - <span style='color:{color}'>{status}</span>\n"
+        msg += "\n/removestreamer &lt;username&gt; to remove"
+        tg_send(msg, chat_id=chat_id)
+
+    elif cmd == "/mystreamersclear":
+        if not USE_SUPABASE:
+            tg_send("User preferences require Supabase database.", chat_id=chat_id)
+            return
+        prefs = db.get_user_preferences(chat_id)
+        for ch in prefs:
+            db.remove_user_preference(chat_id, ch)
+        tg_send(f"Cleared {len(prefs)} streamers from your list.", chat_id=chat_id)
+
 # ---- Poller (5s) ----
-def poller():
-    state = load_state()
-    known = state.get("known", {})
-    poll_count = state.get("polls", 0)
-    cookie_fails = 0
-    log("Poller started")
-    while True:
-        poll_count += 1
+# ============================================================
+#  DROP HUNTER v3 - Always-On Pre-Watch + Aggressive Claim Retry
+# ============================================================
+class DropHunter:
+    """ALWAYS-ON PRE-WATCH + AGGRESSIVE CLAIM approach:
+    1. On startup: watch ALL channels from ALL campaigns 24/7
+    2. For upcoming drops: watch channels IMMEDIATELY (not 15 min before)
+    3. When drop activates: RETRY claim every 3s for 5 minutes
+    4. Track ALL known channels and watch them continuously
+    5. Poll every 2s for faster detection"""
+    
+    def __init__(self):
+        self.active = False
+        self.watching_channels = {}  # slug -> watcher thread info
+        self.claimed_rewards = set()  # campaign_id_reward_id
+        self.known_campaigns = {}  # cid -> status
+        self.known_all_channels = set()  # ALL channels ever seen in campaigns
+        self.user_pref_channels = set()  # User preference channels (no time limit)
+        self.claim_retry_queue = {}  # claim_key -> {campaign_id, reward_id, slug, retries, next_retry}
+        self._lock = threading.Lock()
+    
+    def start(self):
+        if self.active: return
+        self.active = True
+        threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._claim_retry_loop, daemon=True).start()
+        log("[DH] Drop Hunter v3 started - always-on pre-watch + aggressive claim retry")
+    
+    def stop(self):
+        self.active = False
+        with self._lock:
+            for slug, info in self.watching_channels.items():
+                info.get("stop_event", threading.Event()).set()
+            self.watching_channels.clear()
+        log("[DH] Drop Hunter stopped")
+    
+    def _claim_retry_loop(self):
+        """Aggressive claim retry - try every 3s for 5 min after drop activates"""
+        while self.active:
+            try:
+                now = time.time()
+                with self._lock:
+                    to_retry = []
+                    to_remove = []
+                    for key, info in self.claim_retry_queue.items():
+                        if now >= info.get("next_retry", 0):
+                            to_retry.append((key, info))
+                        if info.get("retries", 0) >= 100 or now - info.get("started_at", 0) > 300:
+                            to_remove.append(key)
+                    for key in to_remove:
+                        self.claim_retry_queue.pop(key, None)
+                        log(f"[DH] Retry expired: {key}")
+                
+                for key, info in to_retry:
+                    campaign_id = info.get("campaign_id")
+                    reward_id = info.get("reward_id")
+                    slug = info.get("slug", "?")
+                    
+                    # Check progress first
+                    try:
+                        progress = fetch_progress()
+                        for p in progress:
+                            if str(p.get("id", "")) == str(campaign_id) or str(p.get("campaign_id", "")) == str(campaign_id):
+                                for r in p.get("rewards", []):
+                                    if str(r.get("id", "")) == str(reward_id) or str(r.get("reward_id", "")) == str(reward_id):
+                                        if r.get("claimed"): 
+                                            with self._lock: self.claim_retry_queue.pop(key, None)
+                                            log(f"[DH] Already claimed: {key}")
+                                            break
+                                        ratio = r.get("progress", 0)
+                                        if ratio >= 1.0:
+                                            result = claim_reward(campaign_id, reward_id)
+                                            if result:
+                                                with self._lock: 
+                                                    self.claimed_rewards.add(key)
+                                                    self.claim_retry_queue.pop(key, None)
+                                                log(f"[DH] CLAIMED via retry: {key}")
+                                                tg_send(f"<b>CLAIMED!</b>\n@{slug}\nReward: {reward_id[:20]}", chat_id=ADMIN_ID)
+                                            else:
+                                                info["retries"] = info.get("retries", 0) + 1
+                                                info["next_retry"] = now + 3
+                                        else:
+                                            info["retries"] = info.get("retries", 0) + 1
+                                            info["next_retry"] = now + 3
+                                            log(f"[DH] Retry {info['retries']}: {key} (progress={ratio:.2f})")
+                                        break
+                    except Exception as e:
+                        log(f"[DH] Retry check error for {key}: {e}")
+                    
+                    if key in self.claim_retry_queue and key not in self.claimed_rewards:
+                        with self._lock:
+                            if key in self.claim_retry_queue:
+                                self.claim_retry_queue[key]["retries"] = self.claim_retry_queue[key].get("retries", 0) + 1
+                                self.claim_retry_queue[key]["next_retry"] = now + 3
+            except Exception as e:
+                log(f"[DH] Retry loop error: {e}")
+            time.sleep(2)
+    
+    def _run(self):
+        # Step 1: On startup, discover ALL channels and start watching immediately
+        self._discover_all_channels()
+        
+        # Step 2: Start watching all known channels immediately
+        self._start_watching_all_known()
+        
+        # Step 3: Continuous polling loop - faster (2s)
+        while self.active:
+            try:
+                self._poll_and_watch()
+            except Exception as e:
+                log(f"[DH] Error: {e}")
+            time.sleep(POLL_INTERVAL)
+    
+    def _discover_all_channels(self):
+        """Discover ALL channels from campaigns + watchlist + user preferences."""
+        try:
+            # Source 1: From API (current campaigns)
+            campaigns, _ = fetch_campaigns()
+            if campaigns:
+                for c in campaigns:
+                    for ch in c.get("channels", []):
+                        slug = ch.get("slug") or ch.get("user", {}).get("username", "")
+                        if slug and slug not in self.known_all_channels:
+                            self.known_all_channels.add(slug)
+            
+            # Source 2: From persistent watchlist (manual)
+            watchlist = get_watchlist()
+            for slug in watchlist:
+                if slug not in self.known_all_channels:
+                    self.known_all_channels.add(slug)
+            
+            # Source 3: From followed channels
+            try:
+                followed = get_followed_streamers()
+                for slug in followed:
+                    if slug not in self.known_all_channels:
+                        self.known_all_channels.add(slug)
+            except: pass
+            
+            # Source 4: From user preferences (custom streamers)
+            self.user_pref_channels = set()
+            if USE_SUPABASE:
+                try:
+                    all_prefs = db.get_all_user_preferences()
+                    for pref in all_prefs:
+                        ch = pref.get("channel_name", "")
+                        if ch:
+                            self.user_pref_channels.add(ch)
+                            if ch not in self.known_all_channels:
+                                self.known_all_channels.add(ch)
+                except Exception as e:
+                    log(f"[DH] User prefs load error: {e}")
+            
+            log(f"[DH] Total known: {len(self.known_all_channels)} (watchlist: {len(watchlist)}, user_prefs: {len(self.user_pref_channels)})")
+            
+        except Exception as e:
+            log(f"[DH] Discover error: {e}")
+    
+    def _start_watching_all_known(self):
+        """Start watching ALL known channels that are currently live.
+        - Stake list channels: 30 min limit
+        - User preference channels: No limit (until stopped/offline)"""
+        try:
+            watched = 0
+            for slug in list(self.known_all_channels):
+                if not self.active: break
+                if slug in self.watching_channels: continue
+                info = get_channel_info(slug)
+                if info and info.get("is_live"):
+                    cid = info.get("channel_id")
+                    is_user_pref = slug in self.user_pref_channels
+                    self._start_watching_channel(slug, cid, is_user_pref=is_user_pref)
+                    watched += 1
+                    time.sleep(0.3)
+            log(f"[DH] Started watching {watched} live from {len(self.known_all_channels)} known ({len(self.user_pref_channels)} user prefs)")
+        except Exception as e:
+            log(f"[DH] Start watching error: {e}")
+    
+    def _start_watching_channel(self, slug, channel_id=None, is_manual=False, is_user_pref=False):
+        """Start watching a channel. 
+        - is_manual: No time limit
+        - is_user_pref: Watch until user stops or offline
+        - Default: 30 min limit for Stake list"""
+        if slug in self.watching_channels: return
+        
+        # Get channel info
+        info = get_channel_info(slug)
+        if not info or not info.get("is_live"):
+            log(f"[DH] @{slug} offline, will retry when live")
+            return
+        
+        cid = channel_id or info.get("channel_id")
+        lsid = info.get("livestream_id")
+        
+        stop_event = threading.Event()
+        
+        t = threading.Thread(
+            target=self._watch_loop,
+            args=(slug, cid, lsid, stop_event, is_manual, is_user_pref),
+            daemon=True
+        )
+        
+        with self._lock:
+            self.watching_channels[slug] = {
+                "channel_id": cid,
+                "livestream_id": lsid,
+                "stop_event": stop_event,
+                "started_at": time.time(),
+                "events_sent": 0,
+                "is_manual": is_manual,
+                "is_user_pref": is_user_pref,
+            }
+        
+        t.start()
+        mode = "USER_PREF" if is_user_pref else ("MANUAL" if is_manual else "STAKE_LIST")
+        log(f"[DH] Watching @{slug} ({mode})")
+    
+    def _watch_loop(self, slug, channel_id, livestream_id, stop_event, is_manual=False, is_user_pref=False):
+        """Watch a channel.
+        - Stake list: 30 min limit
+        - User preferences: No limit (until stopped/offline)
+        - Manual: No limit"""
+        start_time = time.time()
+        
+        while not stop_event.is_set():
+            # Check time limit (only for Stake list, not user preferences)
+            elapsed = time.time() - start_time
+            if not is_manual and not is_user_pref and elapsed >= AUTO_WATCH_LIMIT:
+                log(f"[DH] @{slug} 30min limit reached, stopping")
+                break
+            
+            # Check if user preference streamer went offline
+            if is_user_pref and not is_manual:
+                try:
+                    info = get_channel_info(slug)
+                    if not info or not info.get("is_live"):
+                        log(f"[DH] @{slug} offline - stopping user preference watch")
+                        break
+                except: pass
+            
+            try:
+                ws_token = get_ws_token(get_cookie())
+                if not ws_token:
+                    time.sleep(10)
+                    continue
+                
+                ws_url = WS_URL_TEMPLATE.format(token=ws_token)
+                headers = dict(BASE_HEADERS)
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(self._ws_loop(ws_url, headers, slug, channel_id, livestream_id, stop_event))
+                finally:
+                    loop.close()
+            except Exception as e:
+                log(f"[DH] WS error @{slug}: {e}")
+            
+            if not stop_event.is_set():
+                time.sleep(5)
+    
+    async def _ws_loop(self, ws_url, headers, slug, channel_id, livestream_id, stop_event):
+        """WS connection: handshake + user_events every 60s"""
+        import websockets
+        
+        ls_id = livestream_id or channel_id
+        
+        async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+            # Handshake
+            await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
+            try: await asyncio.wait_for(ws.recv(), timeout=5)
+            except asyncio.TimeoutError: pass
+            except Exception as e: log(f"[DH] Handshake recv error @{slug}: {e}")
+            
+            # Initial user_event
+            await send_user_event(ws, channel_id, ls_id)
+            
+            last_ue = time.time()
+            last_ping = time.time()
+            last_refresh = time.time()
+            
+            while not stop_event.is_set():
+                now = time.time()
+                
+                if now - last_ping >= 20:
+                    try:
+                        await ws.send(json.dumps({"type": "ping"}))
+                        last_ping = now
+                        try: await asyncio.wait_for(ws.recv(), timeout=3)
+                        except asyncio.TimeoutError: pass
+                        except Exception as e: log(f"[DH] Ping recv error @{slug}: {e}")
+                    except Exception as e: log(f"[DH] Ping send error @{slug}: {e}")
+                
+                if now - last_ue >= 60:
+                    # Refresh livestream_id
+                    if now - last_refresh >= 300:
+                        last_refresh = now
+                        try:
+                            fresh = get_channel_info(slug)
+                            if fresh and fresh.get("livestream_id"):
+                                ls_id = fresh["livestream_id"]
+                        except Exception as e: log(f"[DH] Refresh error @{slug}: {e}")
+                    
+                    await send_user_event(ws, channel_id, ls_id)
+                    last_ue = now
+                    
+                    with self._lock:
+                        if slug in self.watching_channels:
+                            self.watching_channels[slug]["events_sent"] = self.watching_channels[slug].get("events_sent", 0) + 1
+                
+                await asyncio.sleep(1)
+    
+    def _poll_and_watch(self):
+        """AGGRESSIVE: Check campaigns, start watching ALL channels, claim instantly."""
         campaigns, cookie_ok = fetch_campaigns()
-        if campaigns is None:
-            if not cookie_ok:
-                cookie_fails += 1
-                if cookie_fails == 1:
-                    tg_send_admin("Cookie expired! /setcookie <new>")
-            time.sleep(POLL_INTERVAL + random.uniform(0, 3))
-            continue
-        cookie_fails = 0
-        stake_campaigns = [c for c in campaigns if is_stake_drop(c)]
-        for c in stake_campaigns:
-            cid = c.get("id")
+        if not campaigns: return
+        
+        for c in campaigns:
+            if not self.active: break
+            cid = c.get("id", "")
+            status = c.get("status", "")
+            channels = c.get("channels", [])
+            rewards = c.get("rewards", [])
             name = c.get("name", "?")
-            status = c.get("status", "?")
-            ch_names = [ch.get("user", {}).get("username", "?") for ch in c.get("channels", [])]
-            rew_names = [r.get("name", "?") for r in c.get("rewards", [])]
-            if cid not in known:
-                known[cid] = {"name": name, "status": status}
-                add_to_history(c, "new")
-                countdown = fmt_countdown(c.get("end_at", ""))
-                tg_send(f"<b>NEW STAKE DROP!</b>\n\n<b>{name}</b>\nStatus: {status}\nChannels: {', '.join(ch_names)}\nRewards: {', '.join(rew_names[:5])}\nExpires: {countdown}\n\n<a href='https://kick.com/drops/all-campaigns'>Open Drops</a>")
-                log(f"NEW: {name} ({status})")
-            elif known[cid].get("status") != status:
-                old = known[cid]["status"]
-                known[cid]["status"] = status
-                add_to_history(c, f"{old}->{status}")
-                if status == "active":
-                    countdown = fmt_countdown(c.get("end_at", ""))
-                    tg_send(f"<b>STAKE DROP LIVE!</b>\n\n<b>{name}</b>\nExpires: {countdown}\n\n<a href='https://kick.com/drops/all-campaigns'>OPEN NOW</a>")
-        if poll_count % 60 == 0:
-            log(f"POLL #{poll_count} | {len(campaigns)} total | {len(stake_campaigns)} stake | {len(get_active_subs())} subs")
-        state["known"] = known
-        state["polls"] = poll_count
-        state["last_poll"] = datetime.now().isoformat()
-        save_state(state)
-        time.sleep(POLL_INTERVAL + random.uniform(0, 1))
+            connect = c.get("connect_url", "")
+            start_at = c.get("start_at", "")
+            end_at = c.get("end_at", "")
+            
+            if not channels or not rewards: continue
+            
+            # Track ALL channels from ALL campaigns + AUTO-ADD to watchlist
+            for ch in channels:
+                slug = ch.get("slug") or ch.get("user", {}).get("username", "")
+                if slug:
+                    # Add to known channels
+                    self.known_all_channels.add(slug)
+                    # AUTO-ADD new drop channels to persistent watchlist
+                    if slug not in get_watchlist().get("channels", []):
+                        add_to_watchlist(slug, added_by="auto-drop")
+                        log(f"[DH] Auto-added @{slug} to watchlist (new drop channel)")
+            
+            # Track campaign status changes
+            old_status = self.known_campaigns.get(cid)
+            self.known_campaigns[cid] = status
+            
+            # Handle active drops - AGGRESSIVE CLAIM
+            if status == "active" and old_status != "active":
+                log(f"[DH] NEW ACTIVE: {name}")
+                tg_send(f"<b>DROP ACTIVE!</b>\n<b>{name}</b>\nClaim window: {fmt_countdown(end_at)}\nRetrying every 3s...", chat_id=ADMIN_ID)
+                
+                for ch in channels:
+                    slug = ch.get("slug") or ch.get("user", {}).get("username", "")
+                    if not slug: continue
+                    
+                    # Ensure watching this channel
+                    if slug not in self.watching_channels:
+                        cid_val = ch.get("id") or ch.get("user", {}).get("id")
+                        self._start_watching_channel(slug, cid_val)
+                    
+                    # Try to claim ALL rewards immediately + add to retry queue
+                    for r in rewards:
+                        reward_id = r.get("id", "")
+                        claim_key = f"{cid}_{reward_id}"
+                        if claim_key in self.claimed_rewards: continue
+                        
+                        # Try immediate claim
+                        result = claim_reward(cid, reward_id)
+                        if result:
+                            self.claimed_rewards.add(claim_key)
+                            log(f"[DH] CLAIMED: {r.get('name', '?')}")
+                            tg_send(f"<b>CLAIMED!</b>\n{name}\n{r.get('name', '?')}\n@{slug}", chat_id=ADMIN_ID)
+                        else:
+                            # Add to aggressive retry queue
+                            with self._lock:
+                                self.claim_retry_queue[claim_key] = {
+                                    "campaign_id": cid,
+                                    "reward_id": reward_id,
+                                    "slug": slug,
+                                    "retries": 0,
+                                    "next_retry": time.time() + 3,
+                                    "started_at": time.time(),
+                                }
+                            log(f"[DH] Queued for retry: {r.get('name', '?')} @ {slug}")
+            
+            # Handle ALL upcoming drops - START WATCHING IMMEDIATELY (not 15 min before)
+            if start_at and status == "upcoming":
+                try:
+                    start_time = datetime.fromisoformat(start_at.replace("Z", "+00:00"))
+                    now = datetime.now(start_time.tzinfo) if start_time.tzinfo else datetime.now()
+                    seconds_until = (start_time - now).total_seconds()
+                except: continue
+                
+                # Watch channels IMMEDIATELY for upcoming drops (start watching NOW)
+                if seconds_until > 0:
+                    for ch in channels:
+                        slug = ch.get("slug") or ch.get("user", {}).get("username", "")
+                        if slug and slug not in self.watching_channels:
+                            cid_val = ch.get("id") or ch.get("user", {}).get("id")
+                            log(f"[DH] PRE-WATCH: @{slug} for {name} (starts in {fmt_countdown(start_at)})")
+                            self._start_watching_channel(slug, cid_val)
+        
+        # Also check followed streamers + slots category for potential drop channels
+        try:
+            followed = get_followed_streamers()
+            for slug in followed:
+                if slug not in self.known_all_channels:
+                    self.known_all_channels.add(slug)
+        except: pass
+        
+        try:
+            slots = get_slots_streamers()
+            for s in slots:
+                if s.get("username") and s["username"] not in self.known_all_channels:
+                    self.known_all_channels.add(s["username"])
+        except: pass
+        
+        # Ensure ALL known live channels are being watched (round-robin check)
+        known_list = list(self.known_all_channels)
+        if known_list:
+            # Check 3 channels per cycle (round-robin)
+            check_start = getattr(self, '_check_idx', 0) % len(known_list)
+            for i in range(min(3, len(known_list))):
+                idx = (check_start + i) % len(known_list)
+                slug = known_list[idx]
+                if not self.active: break
+                if slug in self.watching_channels: continue
+                info = get_channel_info(slug)
+                if info and info.get("is_live"):
+                    self._start_watching_channel(slug, info.get("channel_id"))
+                    time.sleep(0.3)
+            self._check_idx = (check_start + 3) % len(known_list)
+        
+        # Re-check ALL progress for unclaimed rewards
+        try:
+            progress = fetch_progress()
+            for p in progress:
+                cid = p.get("id") or p.get("campaign_id", "")
+                total = p.get("progress_units", 0)
+                for r in p.get("rewards", []):
+                    if r.get("claimed"): continue
+                    required = r.get("required_units", 0)
+                    ratio = r.get("progress", 0)
+                    reward_id = r.get("id") or r.get("reward_id", "")
+                    claim_key = f"{cid}_{reward_id}"
+                    
+                    if claim_key in self.claimed_rewards: continue
+                    
+                    # If progress complete, claim immediately
+                    if ratio >= 1.0 or total >= required:
+                        result = claim_reward(cid, reward_id)
+                        if result:
+                            self.claimed_rewards.add(claim_key)
+                            log(f"[DH] CLAIMED via progress: {r.get('name', '?')}")
+                            tg_send(f"<b>CLAIMED!</b>\n{p.get('name', '?')}\n{r.get('name', '?')}", chat_id=ADMIN_ID)
+                    elif ratio > 0.5:
+                        # Close to done - add to retry queue
+                        if claim_key not in self.claim_retry_queue:
+                            with self._lock:
+                                self.claim_retry_queue[claim_key] = {
+                                    "campaign_id": cid,
+                                    "reward_id": reward_id,
+                                    "slug": "?",
+                                    "retries": 0,
+                                    "next_retry": time.time() + 3,
+                                    "started_at": time.time(),
+                                }
+                            log(f"[DH] Almost done ({ratio:.0%}): queued {r.get('name', '?')}")
+        except: pass
+        
+        # Cleanup finished channels, re-add live ones
+        self._refresh_channels()
+    
+    def _refresh_channels(self):
+        """Remove offline channels, re-check periodically."""
+        with self._lock:
+            to_remove = []
+            for slug, info in list(self.watching_channels.items()):
+                elapsed = time.time() - info.get("started_at", 0)
+                # If watching for more than 2 hours without events, might be stuck
+                if elapsed > 7200 and info.get("events_sent", 0) == 0:
+                    to_remove.append(slug)
+            
+            for slug in to_remove:
+                self.watching_channels[slug]["stop_event"].set()
+                del self.watching_channels[slug]
+                log(f"[DH] Removed stale @{slug}")
+    
+    def get_retry_status(self):
+        """Get claim retry queue status."""
+        with self._lock:
+            retries = dict(self.claim_retry_queue)
+        if not retries:
+            return "No pending retries."
+        lines = [f"<b>RETRY QUEUE ({len(retries)}):</b>\n"]
+        for key, info in retries.items():
+            elapsed = int(time.time() - info.get('started_at', 0))
+            retries_count = info.get('retries', 0)
+            lines.append(f"  {key[:30]}: {retries_count} retries, {elapsed}s elapsed")
+        return "\n".join(lines)
+
+drop_hunter = DropHunter()
+
+def poller():
+    """Legacy poller - now just starts DropHunter"""
+    drop_hunter.start()
+    while True:
+        time.sleep(60)
 
 # ---- Main ----
 def main():
     log("=" * 50)
-    log("KICK STAKE DROPS BOT v15 - SMART + FOLLOW + LOGS")
+    log("KICK STAKE DROPS BOT v19 - ALWAYS-ON PRE-WATCH + AGGRESSIVE CLAIM")
     log("=" * 50)
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
     log(f"Dashboard: port {DASHBOARD_PORT} (user: {DASH_USER})")
@@ -1250,7 +2120,7 @@ def main():
         if campaigns:
             follow_drop_streamers(campaigns)
     except: pass
-    tg_send_admin("<b>Bot v15 Started!</b>\n\nSmart claim, follow streamers, logs dashboard.")
+    tg_send_admin("<b>Bot v18 Started!</b>\n\nDrop Hunter active - polling every 3s.\nAuto-detect + auto-watch + auto-claim.")
     log("Listening...")
     offset = 0
     while True:
