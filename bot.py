@@ -1948,7 +1948,7 @@ class DropHunter:
                     # Add to known channels
                     self.known_all_channels.add(slug)
                     # AUTO-ADD new drop channels to persistent watchlist
-                    if slug not in get_watchlist().get("channels", []):
+                    if slug not in get_watchlist():
                         add_to_watchlist(slug, added_by="auto-drop")
                         log(f"[DH] Auto-added @{slug} to watchlist (new drop channel)")
             
