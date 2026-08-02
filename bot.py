@@ -341,17 +341,34 @@ def follow_channel(username):
         log(f"[FOLLOW] Error @{username}: {e}")
         return False
 
+_followed_cache = {"data": None, "ts": 0, "failed": False}
+
 def get_followed_streamers():
+    global _followed_cache
+    now = time.time()
+    # If failed due to 401, don't retry for 30 minutes
+    if _followed_cache["failed"] and now - _followed_cache["ts"] < 1800:
+        return _followed_cache["data"] or []
+    # Cache for 5 minutes
+    if _followed_cache["data"] is not None and now - _followed_cache["ts"] < 300:
+        return _followed_cache["data"]
     try:
         data = kick_request(FOLLOWED_API)
         channels = data.get("channels", [])
-        return [ch.get("channel_slug") or ch.get("user_username") for ch in channels if ch.get("channel_slug")]
+        result = [ch.get("channel_slug") or ch.get("user_username") for ch in channels if ch.get("channel_slug")]
+        _followed_cache = {"data": result, "ts": now, "failed": False}
+        return result
     except urllib.error.HTTPError as e:
-        log(f"[FOLLOWED] HTTP {e.code}: {e.read().decode()[:200] if e.fp else ''}")
-        return []
+        if e.code == 401:
+            _followed_cache["failed"] = True
+            _followed_cache["ts"] = now
+            log(f"[FOLLOWED] Cookie expired (401) - skipping for 30 min")
+        else:
+            log(f"[FOLLOWED] HTTP {e.code}")
+        return _followed_cache["data"] or []
     except Exception as e:
         log(f"[FOLLOWED] Error: {e}")
-        return []
+        return _followed_cache["data"] or []
 
 def get_chatroom_id(username):
     try:
@@ -582,17 +599,33 @@ def fmt_countdown(iso_str):
     except: return "N/A"
 
 def is_stake_drop(c):
+    """Check if this is a Stake $5 drop (short ~2min window, not long ATK-type campaigns)."""
     connect = c.get("connect_url", "").lower()
     name = c.get("name", "").lower()
     channels = c.get("channels", [])
-    if "stake.com" in connect or "stake" in connect: return True
-    if "stake" in name: return True
+    has_stake = False
+    if "stake.com" in connect or "stake" in connect: has_stake = True
+    if "stake" in name: has_stake = True
     for ch in channels:
         username = (ch.get("slug", "") + (ch.get("user") or {}).get("username", "")).lower()
-        if "stake" in username: return True
+        if "stake" in username: has_stake = True
     cat = c.get("category", {})
-    if isinstance(cat, dict) and "stake" in cat.get("name", "").lower(): return True
-    return False
+    if isinstance(cat, dict) and "stake" in cat.get("name", "").lower(): has_stake = True
+    if not has_stake:
+        return False
+    # Real Stake drops have SHORT windows (~2 min = 120s). ATK-type have hours.
+    # Check duration: if campaign lasts > 10 min, it's NOT a Stake drop
+    start_at = c.get("start_at", "")
+    end_at = c.get("end_at", "")
+    if start_at and end_at:
+        try:
+            st = datetime.fromisoformat(start_at.replace("Z", "+00:00"))
+            en = datetime.fromisoformat(end_at.replace("Z", "+00:00"))
+            duration = (en - st).total_seconds()
+            if duration > 600:  # > 10 min = NOT a Stake drop
+                return False
+        except: pass
+    return True
 
 def fmt_campaign(c):
     name = c.get("name", "?")
