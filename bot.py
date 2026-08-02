@@ -418,15 +418,16 @@ def get_session_token(user_id=None):
 def validate_cookie_and_get_user(cookie):
     """Validate cookie by fetching user data from Kick. Returns (valid, username, user_id)"""
     try:
-        headers = dict(BASE_HEADERS)
-        headers["Cookie"] = "session=" + cookie
-        token = None
+        # Ensure cookie is decoded (| not %7C)
         try:
             import urllib.parse
-            token = urllib.parse.unquote(cookie)
-        except: pass
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+            decoded = urllib.parse.unquote(cookie)
+        except:
+            decoded = cookie
+        
+        headers = dict(BASE_HEADERS)
+        headers["Cookie"] = "session=" + decoded
+        headers["Authorization"] = f"Bearer {decoded}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
         
         # Try to get user info from Kick
@@ -444,7 +445,8 @@ def validate_cookie_and_get_user(cookie):
             return True, username, user_id
         return False, None, None
     except urllib.error.HTTPError as e:
-        log(f"[COOKIE] Validation failed: HTTP {e.code}")
+        body = e.read().decode()[:200] if e.fp else ""
+        log(f"[COOKIE] Validation failed: HTTP {e.code}: {body}")
         return False, None, None
     except Exception as e:
         log(f"[COOKIE] Validation error: {e}")
@@ -535,6 +537,7 @@ def get_slots_streamers():
 
 def smart_claim_check(username=None):
     """Smart claim check - progress is RATIO (0-1), not seconds"""
+    global _progress_cache
     try:
         progress = fetch_progress()
         if not progress: return
@@ -547,7 +550,7 @@ def smart_claim_check(username=None):
                 required = r.get("required_units", 0)
                 ratio = r.get("progress", 0)
                 reward_id = r.get("reward_id") or r.get("id")
-                # ratio >= 1.0 means progress >= required
+                claim_key = f"{campaign_id}_{reward_id}"
                 if required > 0 and ratio >= 1.0:
                     log(f"[CLAIM] CLAIMABLE! {total_progress}/{required}s (ratio={ratio})")
                     result = claim_reward(campaign_id, reward_id)
@@ -559,8 +562,7 @@ def smart_claim_check(username=None):
                 elif required > 0 and ratio > 0:
                     remaining_secs = required - total_progress
                     pct = int(ratio * 100)
-                    if remaining_secs <= 300:
-                        log(f"[CLAIM] Almost ready: {total_progress}/{required}s ({pct}%, {remaining_secs:.0f}s left)")
+                    log(f"[CLAIM] Progress: @{username or '?'} {total_progress}/{required}s ({pct}%, {remaining_secs:.0f}s left)")
         return claimed_any
     except Exception as e:
         log(f"[CLAIM] Check error: {e}")
@@ -739,13 +741,15 @@ def _git_commit(message="Auto-save"):
 
 def add_to_watchlist(username, added_by="manual"):
     """Add a channel to the persistent watchlist."""
+    global _watchlist_local_cache
+    username = username.lower().strip("@").strip()
+    _watchlist_local_cache.add(username)
     if USE_SUPABASE:
         try:
             return db.add_to_watchlist_db(username, added_by)
         except Exception as e:
             print(f"[DB] add_to_watchlist fallback: {e}")
     watchlist = load_watchlist()
-    username = username.lower().strip("@").strip()
     if username not in watchlist["channels"]:
         watchlist["channels"].append(username)
         watchlist["added_by"][username] = {"by": added_by, "time": datetime.now().isoformat()}
@@ -771,15 +775,24 @@ def remove_from_watchlist(username):
         return True, f"@{username} removed from watchlist!"
     return False, f"@{username} not in watchlist."
 
+_watchlist_local_cache = set()
+
 def get_watchlist():
     """Get all channels in the watchlist."""
+    global _watchlist_local_cache
+    if _watchlist_local_cache:
+        return list(_watchlist_local_cache)
     if USE_SUPABASE:
         try:
-            return db.get_watchlist_db()
+            result = db.get_watchlist_db()
+            _watchlist_local_cache = set(result) if result else set()
+            return result
         except Exception as e:
             print(f"[DB] get_watchlist fallback: {e}")
     watchlist = load_watchlist()
-    return watchlist.get("channels", [])
+    result = watchlist.get("channels", [])
+    _watchlist_local_cache = set(result)
+    return result
 
 def follow_drop_streamers(campaigns):
     """Follow all streamers from active Stake drops"""
@@ -1499,7 +1512,13 @@ def handle_command(cmd, chat_id, text=""):
             tg_send("Usage: /setcookie &lt;cookie&gt;\n\nKick se cookie paste karo.\nBot validate karega aur tumhara username fetch karega.", chat_id=chat_id)
             return
         
-        cookie = parts[1].strip()
+        raw_cookie = parts[1].strip()
+        # Always decode cookie (if URL-encoded %7C → |)
+        try:
+            import urllib.parse
+            cookie = urllib.parse.unquote(raw_cookie)
+        except:
+            cookie = raw_cookie
         tg_send("Validating cookie...", chat_id=chat_id)
         
         # Validate cookie and get user info
@@ -2045,23 +2064,30 @@ class DropHunter:
                         cid_val = ch.get("id") or (ch.get("user") or {}).get("id")
                         self._start_watching_channel(slug, cid_val)
                     
-                    # Try to claim ALL rewards immediately + add to retry queue
+                    # Try to claim ALL rewards - retry 2 times before giving up
                     for r in rewards:
                         reward_id = r.get("id", "")
                         claim_key = f"{cid}_{reward_id}"
                         if claim_key in self.claimed_rewards: continue
                         if claim_key in self.failed_rewards: continue
                         
-                        # Try immediate claim
-                        result = claim_reward(cid, reward_id)
-                        if result:
-                            self.claimed_rewards.add(claim_key)
-                            log(f"[DH] CLAIMED: {r.get('name', '?')}")
-                            tg_send(f"<b>CLAIMED!</b>\n{name}\n{r.get('name', '?')}\n@{slug}", chat_id=ADMIN_ID)
-                        else:
-                            # INVALID_CLAIM = requirements not met, don't retry
+                        claimed = False
+                        for attempt in range(1, 4):  # try 3 times total
+                            result = claim_reward(cid, reward_id)
+                            if result:
+                                self.claimed_rewards.add(claim_key)
+                                log(f"[DH] CLAIMED: {r.get('name', '?')} (attempt {attempt})")
+                                tg_send(f"<b>CLAIMED!</b>\n{name}\n{r.get('name', '?')}\n@{slug}", chat_id=ADMIN_ID)
+                                claimed = True
+                                break
+                            else:
+                                log(f"[DH] Claim attempt {attempt} failed: {r.get('name', '?')} @ {slug}")
+                                if attempt < 3:
+                                    time.sleep(1)  # 1 sec between retries
+                        
+                        if not claimed:
                             self.failed_rewards.add(claim_key)
-                            log(f"[DH] Claim failed (requirements not met): {r.get('name', '?')} @ {slug}")
+                            log(f"[DH] All 3 attempts failed: {r.get('name', '?')} @ {slug}")
             
             # Handle upcoming Stake drops - notify + PRE-WATCH immediately
             if start_at and status == "upcoming":
