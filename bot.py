@@ -224,7 +224,9 @@ def add_sub(chat_id):
     sid = str(chat_id)
     is_new = sid not in subs or not subs[sid].get("active", True)
     subs[sid] = {"added_at": datetime.now().isoformat(), "active": True}
-    save_subs(subs)
+    saved = save_subs(subs)
+    if is_new:
+        log(f"[SUB] New user: {chat_id} (saved: {saved})")
     return is_new
 
 def remove_sub(chat_id):
@@ -245,11 +247,18 @@ def tg_send(text, parse_mode="HTML", chat_id=None):
         payload = json.dumps({"chat_id": tid, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}).encode()
         req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
-        try: urllib.request.urlopen(req, timeout=15)
-        except: pass
+        try:
+            urllib.request.urlopen(req, timeout=15)
+        except urllib.error.HTTPError as e:
+            if chat_id == ADMIN_ID:
+                log(f"[TG] Admin notify failed: HTTP {e.code}")
+        except Exception as e:
+            if chat_id == ADMIN_ID:
+                log(f"[TG] Admin notify error: {e}")
         time.sleep(0.05)
 
 def tg_send_admin(text):
+    log(f"[TG] Sending to admin {ADMIN_ID}: {text[:50]}...")
     tg_send(text, chat_id=ADMIN_ID)
 
 def tg_get_updates(offset=0):
@@ -570,7 +579,7 @@ def is_stake_drop(c):
     if "stake.com" in connect or "stake" in connect: return True
     if "stake" in name: return True
     for ch in channels:
-        username = (ch.get("slug", "") + ch.get("user", {}).get("username", "")).lower()
+        username = (ch.get("slug", "") + (ch.get("user") or {}).get("username", "")).lower()
         if "stake" in username: return True
     cat = c.get("category", {})
     if isinstance(cat, dict) and "stake" in cat.get("name", "").lower(): return True
@@ -582,7 +591,7 @@ def fmt_campaign(c):
     connect = c.get("connect_url", "none")
     cat = c.get("category", {}).get("name", "?") if isinstance(c.get("category"), dict) else "?"
     channels = c.get("channels", [])
-    ch_str = ", ".join([ch.get("user", {}).get("username", ch.get("slug", "?")) for ch in channels]) if channels else "global"
+    ch_str = ", ".join([(ch.get("user") or {}).get("username", ch.get("slug", "?")) for ch in channels]) if channels else "global"
     rewards = c.get("rewards", [])
     rew_str = ", ".join([r.get("name", "?") for r in rewards[:3]])
     if len(rewards) > 3: rew_str += f" +{len(rewards)-3} more"
@@ -623,7 +632,7 @@ def add_to_history(campaign, event_type="seen"):
         "id": campaign.get("id", "?"),
         "name": campaign.get("name", "?"),
         "status": campaign.get("status", "?"),
-        "channels": [ch.get("user", {}).get("username", ch.get("slug", "?")) for ch in campaign.get("channels", [])],
+        "channels": [(ch.get("user") or {}).get("username", ch.get("slug", "?")) for ch in campaign.get("channels", [])],
         "end_at": campaign.get("end_at", ""),
         "event": event_type,
         "time": datetime.now().isoformat(),
@@ -738,7 +747,7 @@ def follow_drop_streamers(campaigns):
     for c in campaigns:
         if not is_stake_drop(c): continue
         for ch in c.get("channels", []):
-            username = ch.get("slug") or ch.get("user", {}).get("username")
+            username = ch.get("slug") or (ch.get("user") or {}).get("username")
             if username and username not in already_followed:
                 if follow_channel(username):
                     cache["usernames"].append(username)
@@ -1053,7 +1062,7 @@ class ParallelWatcher:
                     for c in campaigns:
                         if is_stake_drop(c) and c.get("status") == "active":
                             for ch in c.get("channels", []):
-                                username = ch.get("slug") or ch.get("user", {}).get("username")
+                                username = ch.get("slug") or (ch.get("user") or {}).get("username")
                                 if username: all_streamers.add(username)
 
                 # Source 2: All followed streamers (not just campaigns)
@@ -1717,7 +1726,7 @@ class DropHunter:
             if campaigns:
                 for c in campaigns:
                     for ch in c.get("channels", []):
-                        slug = ch.get("slug") or ch.get("user", {}).get("username", "")
+                        slug = ch.get("slug") or (ch.get("user") or {}).get("username", "")
                         if slug and slug not in self.known_all_channels:
                             self.known_all_channels.add(slug)
             
@@ -1912,8 +1921,14 @@ class DropHunter:
         campaigns, cookie_ok = fetch_campaigns()
         if not campaigns: return
         
+        # Safety: ensure campaigns is a list of dicts
+        if not isinstance(campaigns, list):
+            log(f"[DH] Unexpected campaigns type: {type(campaigns)}")
+            return
+        
         for c in campaigns:
             if not self.active: break
+            if not isinstance(c, dict): continue  # Skip non-dict items
             cid = c.get("id", "")
             status = c.get("status", "")
             channels = c.get("channels", [])
@@ -1927,7 +1942,8 @@ class DropHunter:
             
             # Track ALL channels from ALL campaigns + AUTO-ADD to watchlist
             for ch in channels:
-                slug = ch.get("slug") or ch.get("user", {}).get("username", "")
+                if not isinstance(ch, dict): continue  # Safety check
+                slug = ch.get("slug") or (ch.get("user") or {}).get("username", "")
                 if slug:
                     # Add to known channels
                     self.known_all_channels.add(slug)
@@ -1946,12 +1962,12 @@ class DropHunter:
                 tg_send(f"<b>DROP ACTIVE!</b>\n<b>{name}</b>\nClaim window: {fmt_countdown(end_at)}\nRetrying every 3s...", chat_id=ADMIN_ID)
                 
                 for ch in channels:
-                    slug = ch.get("slug") or ch.get("user", {}).get("username", "")
+                    slug = ch.get("slug") or (ch.get("user") or {}).get("username", "")
                     if not slug: continue
                     
                     # Ensure watching this channel
                     if slug not in self.watching_channels:
-                        cid_val = ch.get("id") or ch.get("user", {}).get("id")
+                        cid_val = ch.get("id") or (ch.get("user") or {}).get("id")
                         self._start_watching_channel(slug, cid_val)
                     
                     # Try to claim ALL rewards immediately + add to retry queue
@@ -1990,9 +2006,9 @@ class DropHunter:
                 # Watch channels IMMEDIATELY for upcoming drops (start watching NOW)
                 if seconds_until > 0:
                     for ch in channels:
-                        slug = ch.get("slug") or ch.get("user", {}).get("username", "")
+                        slug = ch.get("slug") or (ch.get("user") or {}).get("username", "")
                         if slug and slug not in self.watching_channels:
-                            cid_val = ch.get("id") or ch.get("user", {}).get("id")
+                            cid_val = ch.get("id") or (ch.get("user") or {}).get("id")
                             log(f"[DH] PRE-WATCH: @{slug} for {name} (starts in {fmt_countdown(start_at)})")
                             self._start_watching_channel(slug, cid_val)
         
@@ -2120,7 +2136,7 @@ def main():
         if campaigns:
             follow_drop_streamers(campaigns)
     except: pass
-    tg_send_admin("<b>Bot v18 Started!</b>\n\nDrop Hunter active - polling every 3s.\nAuto-detect + auto-watch + auto-claim.")
+    tg_send_admin("<b>Bot v19 Started!</b>\n\nDrop Hunter active - always-on pre-watch.\nAuto-detect + auto-watch + auto-claim.")
     log("Listening...")
     offset = 0
     while True:
