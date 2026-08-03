@@ -294,7 +294,9 @@ def tg_get_updates(offset=0):
 def kick_request(url, extra_headers=None, timeout=15, user_id=None):
     headers = dict(BASE_HEADERS)
     cookie = get_cookie(user_id)
-    if cookie: headers["Cookie"] = "session=" + cookie
+    if cookie:
+        headers["Cookie"] = "session=" + cookie
+        headers["Authorization"] = f"Bearer {cookie}"
     headers["X-Client-Token"] = KICK_CLIENT_TOKEN
     if extra_headers: headers.update(extra_headers)
     req = urllib.request.Request(url)
@@ -2508,28 +2510,32 @@ def main():
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
     log(f"Dashboard: port {DASHBOARD_PORT} (user: {DASH_USER})")
     
-    # Validate cookie on startup using followed API (not users/me which returns 404)
+    # Validate cookie on startup
     cookie = get_cookie()
     if cookie:
         try:
             headers = dict(BASE_HEADERS)
             headers["Cookie"] = "session=" + cookie
+            headers["Authorization"] = f"Bearer {cookie}"
             headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-            req = urllib.request.Request("https://kick.com/api/v2/channels/followed", headers=headers)
+            req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
             resp = urllib.request.urlopen(req, timeout=10)
             data = json.loads(resp.read().decode())
-            channels = data.get("channels", [])
-            COOKIE_VALIDATED = True
-            log(f"[STARTUP] Cookie VALID - {len(channels)} followed channels")
+            if data.get("username"):
+                COOKIE_VALIDATED = True
+                log(f"[STARTUP] Cookie VALID - @{data['username']}")
+            else:
+                COOKIE_VALIDATED = True
+                log("[STARTUP] Cookie check - no username but no error")
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 COOKIE_VALIDATED = False
                 log("[STARTUP] Cookie EXPIRED! Use /setcookie to update.")
             else:
-                COOKIE_VALIDATED = True  # Other errors don't mean cookie invalid
-                log(f"[STARTUP] Cookie check: HTTP {e.code} (may be Kasada, assuming valid)")
+                COOKIE_VALIDATED = True
+                log(f"[STARTUP] Cookie check: HTTP {e.code} (not cookie issue)")
         except Exception as e:
-            COOKIE_VALIDATED = True  # Network error doesn't mean cookie invalid
+            COOKIE_VALIDATED = True
             log(f"[STARTUP] Cookie check error: {str(e)[:50]} (assuming valid)")
     else:
         COOKIE_VALIDATED = False
