@@ -122,34 +122,44 @@ def load_logs():
     return []
 
 # ---- Cookie ----
+import urllib.parse as _urlparse
+
+# Priority: User-specific > Admin env var > Supabase global > local file
 def get_cookie(user_id=None):
-    """Get cookie - user-specific if available, else global"""
-    # Try user-specific cookie first
+    """Get cookie DECODED: user cookie > admin env cookie > Supabase > file"""
+    raw = ""
+    # 1. User-specific cookie (if user called /setcookie)
     if user_id and USE_SUPABASE:
         try:
             user_data = db.get_user_cookie(user_id)
             if user_data and user_data.get("cookie"):
-                return user_data["cookie"]
+                raw = user_data["cookie"]
         except Exception as e:
             print(f"[DB] get_user_cookie error: {e}")
     
-    # Try global cookie from Supabase
-    if USE_SUPABASE:
+    # 2. Admin env var cookie (KICK_COOKIE) — ALWAYS use this as default
+    if not raw and INITIAL_COOKIE:
+        raw = INITIAL_COOKIE
+    
+    # 3. Supabase global cookie (old fallback)
+    if not raw and USE_SUPABASE:
         try:
             c = db.load_cookie_db()
-            if c: return c
+            if c: raw = c
         except Exception as e:
             print(f"[DB] get_cookie fallback: {e}")
     
-    # Try local file
-    if os.path.exists(COOKIE_FILE):
+    # 4. Local file
+    if not raw and os.path.exists(COOKIE_FILE):
         try:
             with open(COOKIE_FILE) as f:
-                c = json.load(f).get("cookie", "")
-                if c: return c
+                raw = json.load(f).get("cookie", "")
         except: pass
     
-    return INITIAL_COOKIE
+    # ALWAYS decode: %7C → | (Kick needs decoded cookie)
+    if raw:
+        return _urlparse.unquote(raw)
+    return ""
 
 def save_cookie(cookie):
     if USE_SUPABASE:
@@ -162,46 +172,8 @@ def save_cookie(cookie):
         json.dump({"cookie": cookie, "time": datetime.now().isoformat()}, f)
 
 # ---- Session Keeper (HTTP-based, no browser needed) ----
-def _try_playwright_cookie_refresh():
-    """Try to refresh cookie using Playwright (if available).
-    Returns new cookie string or None."""
-    try:
-        from playwright.sync_api import sync_playwright
-        log("[KEEPER] Using Playwright to refresh cookie...")
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-            ctx = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-            cookie = get_cookie()
-            if cookie:
-                ctx.add_cookies([{"name": "session", "value": cookie, "domain": ".kick.com", "path": "/"}])
-            page = ctx.new_page()
-            # Visit kick.com to trigger session refresh
-            for url in ["https://kick.com/", "https://kick.com/drops/all-campaigns"]:
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                    time.sleep(3)
-                except: pass
-            # Extract refreshed cookie
-            new_cookie = None
-            for c in ctx.cookies():
-                if c["name"] == "session":
-                    new_cookie = c["value"]
-                    break
-            browser.close()
-            if new_cookie and new_cookie != cookie:
-                log(f"[KEEPER] Cookie refreshed via Playwright ({len(new_cookie)} chars)")
-                return new_cookie
-            elif new_cookie:
-                log("[KEEPER] Cookie same after Playwright refresh")
-                return new_cookie
-    except ImportError:
-        log("[KEEPER] Playwright not installed - using HTTP-only refresh")
-    except Exception as e:
-        log(f"[KEEPER] Playwright error: {str(e)[:80]}")
-    return None
-
 def session_keeper():
-    """Keep session alive. Uses Playwright if available, else HTTP."""
+    """Keep session alive via HTTP check."""
     global COOKIE_VALIDATED
     log("Session keeper started")
     while True:
@@ -213,42 +185,29 @@ def session_keeper():
                 time.sleep(KEEPER_INTERVAL)
                 continue
             
-            # Try Playwright refresh first (best for keeping cookie alive)
-            new_cookie = _try_playwright_cookie_refresh()
-            if new_cookie:
-                save_cookie(new_cookie)
-                COOKIE_VALIDATED = True
-                log(f"[KEEPER] Session refreshed via Playwright")
-                time.sleep(KEEPER_INTERVAL)
-                continue
-            
-            # Fallback: HTTP request to validate cookie using followed API
-            # (users/me returns 404 due to Kasada, so use followed instead)
             headers = dict(BASE_HEADERS)
             headers["Cookie"] = "session=" + cookie
+            headers["Authorization"] = f"Bearer {cookie}"
             headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-            req = urllib.request.Request("https://kick.com/api/v2/channels/followed", headers=headers)
+            req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
             resp = urllib.request.urlopen(req, timeout=15)
             data = json.loads(resp.read().decode())
-            channels = data.get("channels", [])
             
-            if channels is not None:  # Valid response (even if empty list)
-                log(f"[KEEPER] Session alive - {len(channels)} followed channels")
+            if data.get("username"):
+                log(f"[KEEPER] Session alive - @{data['username']}")
                 COOKIE_VALIDATED = True
             else:
-                log("[KEEPER] Cookie invalid - no data returned")
-                COOKIE_VALIDATED = False
-                tg_send_admin("<b>⚠️ Cookie invalid!</b>\nUse /setcookie to update.")
+                log("[KEEPER] Cookie valid but no user data")
+                COOKIE_VALIDATED = True
             
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                log("[KEEPER] Cookie EXPIRED! Send /setcookie to update.")
+                log("[KEEPER] Cookie EXPIRED! Use /setcookie to update.")
                 COOKIE_VALIDATED = False
                 tg_send_admin("<b>🔴 Cookie EXPIRED!</b>\nBot cannot claim drops.\nSend /setcookie with new cookie.")
             elif e.code == 404:
-                log("[KEEPER] API 404 - retrying with different endpoint")
-                # users/me returns 404 due to Kasada, not cookie issue
-                COOKIE_VALIDATED = True  # Don't mark invalid based on 404
+                log("[KEEPER] API 404 - cookie might be OK")
+                COOKIE_VALIDATED = True
             else:
                 log(f"[KEEPER] HTTP {e.code}")
         except Exception as e:
@@ -483,11 +442,8 @@ def get_ws_token(session_token):
     except: return None
 
 def get_session_token(user_id=None):
-    """Return decoded cookie as Bearer token - browser uses | not %7C"""
-    cookie = get_cookie(user_id)
-    if not cookie: return None
-    import urllib.parse
-    return urllib.parse.unquote(cookie)
+    """Return decoded cookie as Bearer token"""
+    return get_cookie(user_id)  # Already decoded by get_cookie()
 
 def validate_cookie_and_get_user(cookie):
     """Validate cookie by fetching followed channels from Kick.
@@ -528,15 +484,17 @@ def validate_cookie_and_get_user(cookie):
 
 _progress_cache = {"data": None, "ts": 0}
 
-def fetch_progress():
+def fetch_progress(user_id=None):
     global _progress_cache
     now = time.time()
     # Cache for 5 seconds to avoid 403 rate limits
+    cache_key = f"user_{user_id}" if user_id else "global"
     if _progress_cache["data"] is not None and now - _progress_cache["ts"] < 5:
         return _progress_cache["data"]
     try:
+        cookie = get_cookie(user_id)
         headers = dict(BASE_HEADERS)
-        headers["Cookie"] = "session=" + get_cookie()
+        headers["Cookie"] = "session=" + cookie
         headers["Authorization"] = f"Bearer {get_session_token()}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
         req = urllib.request.Request(PROGRESS_API)
@@ -552,11 +510,12 @@ def fetch_progress():
         log(f"[PROGRESS] Error: {e}")
         return _progress_cache["data"] or []
 
-def claim_reward(campaign_id, reward_id):
+def claim_reward(campaign_id, reward_id, user_id=None):
     try:
+        cookie = get_cookie(user_id)
         headers = dict(BASE_HEADERS)
-        headers["Cookie"] = "session=" + get_cookie()
-        headers["Authorization"] = f"Bearer {get_session_token()}"
+        headers["Cookie"] = "session=" + cookie
+        headers["Authorization"] = f"Bearer {cookie}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
         headers["Content-Type"] = "application/json"
         body = json.dumps({"campaign_id": campaign_id, "reward_id": reward_id}).encode()
