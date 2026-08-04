@@ -571,47 +571,47 @@ def try_claim_in_chat(username):
     return None
 
 def get_ws_token(session_token):
-    """Get WebSocket viewer token using tls_client for Chrome TLS fingerprint.
-    MUST include session cookie + Bearer auth for drop tracking to work!
-    Matches kickautodrops pattern: cookies + Bearer + X-Client-Token."""
+    """Get WebSocket viewer token.
+    CRITICAL: Must ADD session cookie to cookie jar, NOT override headers!
+    Overwriting headers loses Cloudflare cf_clearance cookie."""
     s = get_tls_session()
     if s:
         try:
-            # First visit kick.com to establish Cloudflare clearance cookies
-            s.get("https://kick.com/", timeout_seconds=10)
+            # Step 1: Visit kick.com to get Cloudflare clearance cookies
+            resp = s.get("https://kick.com/", timeout_seconds=10)
             
-            # CRITICAL: Must include session cookie AND Bearer auth
-            # Without auth, the WS token won't track drop progress!
+            # Step 2: ADD session cookie to cookie jar (NOT override headers!)
+            # This preserves cf_clearance from step 1
             if session_token:
-                s.headers["Cookie"] = f"session={session_token}"
+                s.cookies.set("session", session_token, domain=".kick.com")
                 s.headers["Authorization"] = f"Bearer {session_token}"
             s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
             s.headers["Accept"] = "application/json, text/plain, */*"
             s.headers["Referer"] = "https://kick.com/"
             s.headers["Origin"] = "https://kick.com"
-            s.headers["Sec-Fetch-Site"] = "same-site"
+            
+            # Step 3: Get WS token (with all cookies including cf_clearance)
             resp = s.get("https://websockets.kick.com/viewer/v1/token", timeout_seconds=10)
             if resp.status_code == 200:
                 data = resp.json()
                 token = data.get("data", {}).get("token")
                 if token:
-                    print(f"[WS-TOKEN] Got token with auth ({len(token)} chars)")
+                    print(f"[WS-TOKEN] Got token ({len(token)} chars)")
                     return token
                 else:
-                    print(f"[WS-TOKEN] 200 but no token in response: {str(data)[:200]}")
+                    print(f"[WS-TOKEN] 200 but no token: {str(data)[:200]}")
             else:
-                print(f"[WS-TOKEN] tls_client HTTP {resp.status_code}: {resp.text[:200]}")
+                print(f"[WS-TOKEN] HTTP {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
             print(f"[WS-TOKEN] tls_client error: {e}")
     
-    # Fallback to urllib - MUST include Bearer auth
+    # Fallback to urllib
     try:
         headers = dict(BASE_HEADERS)
         if session_token:
             headers["Cookie"] = f"session={session_token}"
             headers["Authorization"] = f"Bearer {session_token}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-        headers["Sec-Fetch-Site"] = "same-site"
         req = urllib.request.Request(WS_TOKEN_API)
         for k, v in headers.items():
             req.add_header(k, v)
@@ -619,7 +619,7 @@ def get_ws_token(session_token):
         data = json.loads(resp.read().decode())
         token = data.get("data", {}).get("token")
         if token:
-            print(f"[WS-TOKEN] Got token via urllib with auth ({len(token)} chars)")
+            print(f"[WS-TOKEN] Got token via urllib ({len(token)} chars)")
         return token
     except Exception as e:
         print(f"[WS-TOKEN] urllib error: {e}")
@@ -1463,7 +1463,7 @@ class SingleStreamWatcher:
             last_alive = time.time()
             last_refresh = time.time()
             watch_start = time.time()
-            ue_interval = random.randint(45, 65)
+            ue_interval = 30  # user_event every 30s for faster counting
             
             while not self.stop_event.is_set():
                 counter += 1
@@ -1477,7 +1477,7 @@ class SingleStreamWatcher:
                     await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
                 
                 await curl_ws_recv(ws, session, timeout=1.0)
-                await asyncio.sleep(random.randint(13, 18))
+                await asyncio.sleep(5)  # Keepalive every 5s
                 
                 now = time.time()
                 elapsed_since_start = now - watch_start
@@ -1489,7 +1489,7 @@ class SingleStreamWatcher:
                         self.events_sent += 1
                         self.watch_time += 60
                     last_ue = now
-                    ue_interval = random.randint(45, 65)
+                    ue_interval = 30  # user_event every 30s for faster counting
                     if elapsed_since_start >= 60:
                         smart_claim_check(username, user_id=self.user_id)
                     log(f"[WATCH] event #{self.events_sent} @{username} ({fmt_duration(self.watch_time)})")
@@ -1735,7 +1735,7 @@ class StreamWatcher:
             last_ue = time.time()
             last_refresh = time.time()
             ev_count = 1
-            ue_interval = random.randint(45, 65)
+            ue_interval = 30  # user_event every 30s for faster counting
             counter = 0
             
             while not self.stop_event.is_set():
@@ -1752,7 +1752,7 @@ class StreamWatcher:
                     await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
                 
                 await curl_ws_recv(ws, session, timeout=1.0)
-                await asyncio.sleep(random.randint(13, 18))
+                await asyncio.sleep(5)  # Keepalive every 5s
                 
                 now = time.time()
                 elapsed = now - start
@@ -1760,7 +1760,7 @@ class StreamWatcher:
                     await send_user_event(ws, channel_id, ls_id, session)
                     ev_count += 1
                     last_ue = now
-                    ue_interval = random.randint(45, 65)
+                    ue_interval = 30  # user_event every 30s for faster counting
                     remaining = int(self.target_seconds - elapsed)
                     log(f"[SW] event #{ev_count} @{username} ({remaining}s left)")
                 if now - last_refresh >= 300:
@@ -1957,7 +1957,7 @@ class SlotsWatcher:
             
             start = time.time()
             last_ue = time.time()
-            ue_interval = random.randint(45, 65)
+            ue_interval = 30  # user_event every 30s for faster counting
             counter = 0
             
             while not stop_event.is_set():
@@ -1976,7 +1976,7 @@ class SlotsWatcher:
                     await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
                 
                 await curl_ws_recv(ws, session, timeout=1.0)
-                await asyncio.sleep(random.randint(13, 18))
+                await asyncio.sleep(5)  # Keepalive every 5s
                 
                 # user_event every 60s
                 now = time.time()
@@ -1984,7 +1984,7 @@ class SlotsWatcher:
                 if now - last_ue >= ue_interval:
                     await send_user_event(ws, channel_id, ls_id, session)
                     last_ue = now
-                    ue_interval = random.randint(45, 65)
+                    ue_interval = 30  # user_event every 30s for faster counting
                     remaining = int(target_seconds - elapsed)
                     log(f"[SW] @{username} event ({remaining}s left)")
                     if elapsed >= 60:
@@ -2425,6 +2425,27 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
     elif cmd == "/watchroundstatus":
         tg_send(pw.get_status(), chat_id=chat_id)
 
+    elif cmd == "/debugws":
+        # Debug WebSocket connection
+        cookie = get_cookie(chat_id)
+        if not cookie:
+            tg_send("<b>DEBUG:</b> No cookie set!", chat_id=chat_id)
+            return
+        
+        # Test WS token
+        ws_token = get_ws_token(cookie)
+        if not ws_token:
+            tg_send(f"<b>DEBUG:</b>\nCookie: {len(cookie)} chars\nWS Token: <b>FAILED</b>\n\nCookie may be expired!", chat_id=chat_id)
+            return
+        
+        # Test channel info
+        info = get_channel_info("kick")
+        if not info:
+            tg_send(f"<b>DEBUG:</b>\nCookie: OK ({len(cookie)} chars)\nWS Token: OK ({len(ws_token)} chars)\nChannel API: FAILED", chat_id=chat_id)
+            return
+        
+        tg_send(f"<b>DEBUG OK:</b>\nCookie: {len(cookie)} chars\nWS Token: {len(ws_token)} chars\nChannel: {info.get('username')} (live: {info.get('is_live')})\n\nTry /watchtest kick now!", chat_id=chat_id)
+    
     elif cmd == "/watchtest":
         parts = text.split()
         if len(parts) < 2:
@@ -2741,7 +2762,7 @@ async def _test_ws_loop(ws_url, headers, slug, channel_id, livestream_id, stop_e
         
         last_ue = time.time()
         events_sent = 1
-        ue_interval = random.randint(45, 65)
+        ue_interval = 30  # user_event every 30s for faster counting
         counter = 0
         
         while not stop_event.is_set():
@@ -2759,7 +2780,7 @@ async def _test_ws_loop(ws_url, headers, slug, channel_id, livestream_id, stop_e
                 await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
             
             await curl_ws_recv(ws, session, timeout=1.0)
-            await asyncio.sleep(random.randint(13, 18))
+            await asyncio.sleep(5)  # Keepalive every 5s
             
             now = time.time()
             elapsed = now - start_time
@@ -2767,7 +2788,7 @@ async def _test_ws_loop(ws_url, headers, slug, channel_id, livestream_id, stop_e
                 await send_user_event(ws, channel_id, ls_id, session)
                 events_sent += 1
                 last_ue = now
-                ue_interval = random.randint(45, 65)
+                ue_interval = 30  # user_event every 30s for faster counting
                 remaining = int(duration_secs - elapsed)
                 log(f"[TEST] @{slug} event #{events_sent} ({remaining//60}m left)")
     finally:
@@ -3125,7 +3146,7 @@ class DropHunter:
             counter = 0
             last_ue = time.time()
             last_refresh = time.time()
-            ue_interval = random.randint(45, 65)
+            ue_interval = 30  # user_event every 30s for faster counting
             
             while not stop_event.is_set():
                 counter += 1
@@ -3140,7 +3161,7 @@ class DropHunter:
                 await curl_ws_recv(ws, session, timeout=1.0)
                 
                 # Random delay 13-18 seconds (kickautodrops pattern)
-                delay = random.randint(13, 18)
+                delay = 5  # Keepalive every 5s
                 await asyncio.sleep(delay)
                 
                 # user_event every 60s
@@ -3157,7 +3178,7 @@ class DropHunter:
                     
                     await send_user_event(ws, channel_id, ls_id, session)
                     last_ue = now
-                    ue_interval = random.randint(45, 65)
+                    ue_interval = 30  # user_event every 30s for faster counting
                     
                     with self._lock:
                         if slug in self.watching_channels:
