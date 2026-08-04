@@ -51,7 +51,7 @@ FOLLOW_API = "https://kick.com/api/v2/channels/{channel_slug}/follow"
 FOLLOWED_API = "https://kick.com/api/v2/channels/followed"
 FOLLOW_COOLDOWN = {}  # username -> timestamp when retry allowed
 CATEGORY_LIVESTREAMS = "https://web.kick.com/api/v1/livestreams?category_id={cat_id}&limit=50&sort=viewer_count_desc"
-CATEGORIES_SEARCH = "https://kick.com/api/v2/categories"
+CATEGORIES_SEARCH_V1 = "https://kick.com/api/v1/categories"
 WS_TOKEN_API = "https://websockets.kick.com/viewer/v1/token"
 WS_URL_TEMPLATE = "wss://websockets.kick.com/viewer/v1/connect?token={token}"
 KICK_CLIENT_TOKEN = os.environ.get("KICK_CLIENT_TOKEN", "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823")
@@ -66,6 +66,7 @@ WATCHLIST_FILE = "tg_watchlist.json"  # Manual channel watchlist (persistent)
 DASHBOARD_PORT = int(os.environ.get("PORT", "8080"))
 KEEPER_INTERVAL = 1800
 SLOTS_CATEGORY_ID = None
+BOT_START_TIME = time.time()  # Track bot uptime
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -457,20 +458,30 @@ def get_session_token(user_id=None):
 def validate_cookie_and_get_user(cookie):
     """Validate cookie by fetching followed channels from Kick.
     Returns (valid, username_or_count, user_id_or_channels)
-    Note: users/me returns 404 due to Kasada, so we use followed API instead."""
+    
+    Note: kick.com/api/v2 endpoints are Kasada-protected and may fail.
+    We try multiple validation methods:
+    1. kick.com/api/v2/channels/followed (primary - returns followed channels)
+    2. kick.com/api/v2/users/me (fallback - returns user info)
+    """
+    # Ensure cookie is decoded (| not %7C)
     try:
-        # Ensure cookie is decoded (| not %7C)
-        try:
-            import urllib.parse
-            decoded = urllib.parse.unquote(cookie)
-        except:
-            decoded = cookie
-        
+        import urllib.parse
+        decoded = urllib.parse.unquote(cookie)
+    except:
+        decoded = cookie
+    
+    if not decoded or len(decoded) < 10:
+        log("[COOKIE] Validation failed: cookie too short or empty")
+        return False, None, None
+    
+    # Method 1: Try followed channels API
+    try:
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + decoded
+        headers["Authorization"] = "Bearer " + decoded
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
         
-        # Use followed API (users/me returns 404 due to Kasada)
         req = urllib.request.Request("https://kick.com/api/v2/channels/followed")
         for k, v in headers.items():
             req.add_header(k, v)
@@ -482,14 +493,59 @@ def validate_cookie_and_get_user(cookie):
             channel_names = [ch.get("channel_slug", "?") for ch in channels[:3]]
             log(f"[COOKIE] Valid! {len(channels)} followed channels: {', '.join(channel_names)}")
             return True, f"{len(channels)} channels", len(channels)
-        return False, None, None
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:200] if e.fp else ""
-        log(f"[COOKIE] Validation failed: HTTP {e.code}: {body}")
-        return False, None, None
+        log(f"[COOKIE] Method 1 (followed) failed: HTTP {e.code}: {body}")
     except Exception as e:
-        log(f"[COOKIE] Validation error: {e}")
-        return False, None, None
+        log(f"[COOKIE] Method 1 error: {e}")
+    
+    # Method 2: Try users/me API
+    try:
+        headers = dict(BASE_HEADERS)
+        headers["Cookie"] = "session=" + decoded
+        headers["Authorization"] = "Bearer " + decoded
+        headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+        
+        req = urllib.request.Request("https://kick.com/api/v2/users/me")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode())
+        
+        if data.get("username"):
+            log(f"[COOKIE] Valid via users/me: @{data['username']}")
+            return True, data["username"], data.get("id", 0)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:200] if e.fp else ""
+        log(f"[COOKIE] Method 2 (users/me) failed: HTTP {e.code}: {body}")
+    except Exception as e:
+        log(f"[COOKIE] Method 2 error: {e}")
+    
+    # Method 3: Try drops API (if cookie is for claiming)
+    try:
+        headers = dict(BASE_HEADERS)
+        headers["Cookie"] = "session=" + decoded
+        headers["Authorization"] = "Bearer " + decoded
+        headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+        
+        req = urllib.request.Request("https://web.kick.com/api/v1/drops/campaigns")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode())
+        campaigns = data.get("data", [])
+        
+        if campaigns is not None:  # Valid response (even if empty)
+            log(f"[COOKIE] Cookie accepted by drops endpoint! {len(campaigns)} campaigns available")
+            return True, f"{len(campaigns)} campaigns", 0
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:200] if e.fp else ""
+        log(f"[COOKIE] Method 3 (drops) failed: HTTP {e.code}: {body}")
+    except Exception as e:
+        log(f"[COOKIE] Method 3 error: {e}")
+    
+    log("[COOKIE] All validation methods failed - cookie may be expired or invalid")
+    return False, None, None
 
 _progress_cache = {"data": None, "ts": 0}
 
@@ -543,39 +599,90 @@ def claim_reward(campaign_id, reward_id, user_id=None):
         return None
 
 def search_slots_category():
-    """Find Slots & Casino category ID"""
+    """Find Slots & Casino category ID using working v1 API.
+    v2/categories is Kasada-blocked, so we use v1/categories instead."""
     global SLOTS_CATEGORY_ID
     if SLOTS_CATEGORY_ID: return SLOTS_CATEGORY_ID
+    
+    # Method 1: Use v1/categories API (works without Kasada)
     try:
-        data = kick_request(CATEGORIES_SEARCH)
+        req = urllib.request.Request(CATEGORIES_SEARCH_V1)
+        for k, v in BASE_HEADERS.items():
+            req.add_header(k, v)
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode())
         categories = data if isinstance(data, list) else data.get("data", [])
         for cat in categories:
             name = cat.get("name", "").lower()
-            if "slots" in name or "casino" in name:
+            if "gambling" in name:  # Gambling = parent of Slots & Casino
                 SLOTS_CATEGORY_ID = cat.get("id")
-                log(f"[CAT] Slots & Casino category ID: {SLOTS_CATEGORY_ID}")
+                log(f"[CAT] Found Gambling category ID: {SLOTS_CATEGORY_ID}")
                 return SLOTS_CATEGORY_ID
-    except: pass
-    return None
+    except Exception as e:
+        log(f"[CAT] v1 categories search error: {e}")
+    
+    # Method 2: Hardcode known Gambling category ID (4)
+    SLOTS_CATEGORY_ID = 4
+    log("[CAT] Using hardcoded Gambling category ID: 4")
+    return SLOTS_CATEGORY_ID
+
+_slots_cache = {"data": [], "ts": 0}
 
 def get_slots_streamers():
-    """Get live streamers from Slots & Casino category as fallback"""
-    cat_id = search_slots_category()
-    if not cat_id: return []
+    """Get live streamers from Slots & Casino / Gambling category.
+    Uses public API (no auth needed) and filters by category name.
+    Caches results for 30 seconds to avoid excessive API calls."""
+    global _slots_cache
+    now = time.time()
+    
+    # Return cached if fresh (< 30 seconds)
+    if _slots_cache["data"] and now - _slots_cache["ts"] < 30:
+        return _slots_cache["data"]
+    
     try:
-        data = kick_request(CATEGORY_LIVESTREAMS.format(cat_id=cat_id))
-        streams = data.get("data", []) if isinstance(data, dict) else data
+        # Fetch live streams from public API (no auth needed)
+        # Use limit=100 (200 may trigger rate limits on some servers)
+        url = "https://web.kick.com/api/v1/livestreams?limit=100&sort=viewer_count_desc"
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", BASE_HEADERS["User-Agent"])
+        req.add_header("Accept", "application/json")
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = json.loads(resp.read().decode())
+        
+        livestreams = data.get("data", {}).get("livestreams", [])
         result = []
-        for s in streams:
-            user = s.get("broadcaster_user", {}) if "broadcaster_user" in s else s.get("channel", {})
-            username = user.get("username", "") or s.get("slug", "")
-            channel_id = user.get("id") or s.get("channel_id")
-            livestream_id = s.get("id") or s.get("livestream_id")
-            if username and channel_id:
-                result.append({"username": username, "channel_id": channel_id, "livestream_id": livestream_id})
-        log(f"[CAT] Found {len(result)} Slots & Casino streamers")
+        
+        # Gambling-related category keywords
+        GAMBLING_KEYWORDS = ["slot", "casino", "poker", "blackjack", "roulette", "baccarat", "gambling", "craps", "bingo"]
+        
+        for s in livestreams:
+            cat = s.get("category", {})
+            cat_name = cat.get("name", "").lower()
+            cat_slug = cat.get("slug", "").lower()
+            
+            # Filter for gambling-related categories
+            if any(kw in cat_name or kw in cat_slug for kw in GAMBLING_KEYWORDS):
+                channel = s.get("channel", {})
+                username = channel.get("username", "")
+                channel_id = channel.get("id")
+                livestream_id = s.get("id")
+                
+                if username and channel_id:
+                    result.append({
+                        "username": username,
+                        "channel_id": channel_id,
+                        "livestream_id": livestream_id,
+                        "category": cat.get("name", "?"),
+                        "viewers": s.get("viewer_count", 0)
+                    })
+        
+        # Update cache
+        _slots_cache = {"data": result, "ts": now}
+        log(f"[CAT] Found {len(result)} Slots & Casino/Gambling streamers from {len(livestreams)} total live")
         return result
-    except: return []
+    except Exception as e:
+        log(f"[CAT] Error fetching slots streamers: {e}")
+        return _slots_cache["data"] or []
 
 def smart_claim_check(username=None, user_id=None):
     """Smart claim check - progress is RATIO (0-1), not seconds.
@@ -1652,7 +1759,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             name_display = f" ({first_name})" if first_name else ""
             tg_send_admin(f"<b>NEW USER!</b>\n{display}{name_display}\nTotal: {len(get_active_subs())}")
         tg_send(
-            "<b>Kick Drops Bot v20</b>\n\n"
+            "<b>Kick Drops Bot v26</b>\n\n"
             "<b>DROP HUNTER (auto):</b>\n"
             "/dh - Drop Hunter status\n"
             "/dhretry - Claim retry queue\n\n"
@@ -1670,12 +1777,15 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             "/stake - Stake campaigns\n"
             "/live - Live streams\n"
             "/history - Drop history\n"
-            "/status - Bot status\n\n"
+            "/status - Bot status\n"
+            "/stats - Detailed statistics\n"
+            "/ping - Check bot responsiveness\n"
+            "/uptime - Bot uptime\n\n"
             "<b>MANUAL WATCH:</b>\n"
             "/watchtest &lt;user1&gt; [user2] - Watch streams\n"
             "/watchstop - Stop all watchers\n"
             "/watchstatus - Watch info\n"
-            "/watchnow - Admin: watch Slots & Casino 24/7\n"
+            "/watchnow - Admin: watch Slots &amp; Casino 24/7\n"
             "/startwatching - Test: watch all known live (1 hour)\n\n"
             "<b>CONFIG:</b>\n"
             "/setcookie - Update cookie\n"
@@ -1771,7 +1881,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
     elif cmd == "/setcookie":
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            tg_send("Usage: /setcookie &lt;cookie&gt;\n\nKick se cookie paste karo.\nBot validate karega aur tumhara username fetch karega.", chat_id=chat_id)
+            tg_send("Usage: /setcookie &lt;cookie&gt;\n\nPaste your Kick cookie here.\nBot will validate and fetch your username.", chat_id=chat_id)
             return
         
         raw_cookie = parts[1].strip()
@@ -1798,14 +1908,14 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
                    f"<b>Status:</b> VALID\n"
                    f"<b>Followed:</b> {username}\n"
                    f"<b>Your TG ID:</b> {chat_id}\n\n"
-                   f"Ab tumhare liye yeh cookie use hogi.\n"
-                   f"Bot automatically drops claim karega.")
+                   f"This cookie will be used for your account.\n"
+                   f"Bot will automatically claim drops.")
             tg_send(msg, chat_id=chat_id)
             tg_send_admin(f"<b>NEW COOKIE SET!</b>\nFollowed: {username}\nTG: {chat_id}")
         else:
             # Invalid cookie - save as global fallback
             save_cookie(cookie)
-            tg_send("Cookie saved (validation failed - using as global fallback).\nAgar yeh cookie valid hai toh baad mein kaam karegi.", chat_id=chat_id)
+            tg_send("Cookie saved (validation failed - using as global fallback).\nIf this cookie is valid, it will work later.", chat_id=chat_id)
 
     elif cmd == "/checkcookie":
         global COOKIE_VALIDATED
@@ -2003,7 +2113,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
     elif cmd == "/addstreamer":
         parts = text.split()
         if len(parts) < 2:
-            tg_send("Usage: /addstreamer &lt;username&gt;\n\nApne manpasand streamer add karo.\nJab tak woh live hai aur tum band na karo, bot watch karega.", chat_id=chat_id)
+            tg_send("Usage: /addstreamer &lt;username&gt;\n\nAdd your favorite streamer.\nBot will watch them as long as they are live and you do not stop it.", chat_id=chat_id)
             return
         username = parts[1].strip("@").strip()
         if USE_SUPABASE:
@@ -2051,6 +2161,119 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         for ch in prefs:
             db.remove_user_preference(chat_id, ch)
         tg_send(f"Cleared {len(prefs)} streamers from your list.", chat_id=chat_id)
+
+    # ---- Admin Commands ----
+    elif cmd == "/broadcast":
+        # Admin only: broadcast message to all users
+        if chat_id != ADMIN_ID:
+            tg_send("<b>Admin only command.</b>", chat_id=chat_id)
+            return
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            tg_send("Usage: /broadcast &lt;message&gt;\n\nSends your message to all subscribed users.", chat_id=chat_id)
+            return
+        message = parts[1]
+        subs = get_active_subs()
+        if not subs:
+            tg_send("No subscribers to broadcast to.", chat_id=chat_id)
+            return
+        # Add admin signature
+        broadcast_msg = f"<b>Message from Admin:</b>\n\n{message}\n\n<i>Sent to {len(subs)} users</i>"
+        sent_count = 0
+        failed_count = 0
+        for uid in subs:
+            try:
+                payload = json.dumps({"chat_id": uid, "text": broadcast_msg, "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
+                req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=payload, method="POST")
+                req.add_header("Content-Type", "application/json")
+                urllib.request.urlopen(req, timeout=15)
+                sent_count += 1
+                time.sleep(0.05)  # Rate limit protection
+            except:
+                failed_count += 1
+        log(f"[BROADCAST] Sent to {sent_count}/{len(subs)} users (failed: {failed_count})")
+        tg_send(f"<b>Broadcast Complete!</b>\n\nSent: {sent_count}\nFailed: {failed_count}\nTotal: {len(subs)}", chat_id=chat_id)
+
+    elif cmd == "/stats":
+        # Detailed bot statistics
+        subs = load_subs()
+        active_subs = get_active_subs()
+        state = load_state()
+        history = load_history()
+        watchlist = get_watchlist()
+        
+        # Watcher stats
+        sw_watching = len(slots_watcher.watching) if slots_watcher.active else 0
+        pw_watching = len(pw.watchers) if pw.active else 0
+        single_watching = len(single_watcher.watchers) if single_watcher.active else 0
+        total_watching = sw_watching + pw_watching + single_watching
+        
+        # Drop stats
+        known_channels = len(state.get("known", {}))
+        total_polls = state.get("polls", 0)
+        claimed = len(state.get("claimed", {}))
+        history_count = len(history)
+        
+        # Cookie status
+        cookie = get_cookie()
+        cookie_status = "SET" if cookie else "NOT SET"
+        
+        # Slots streamers
+        slots_streamers = get_slots_streamers()
+        
+        msg = (f"<b>STATISTICS</b>\n"
+                f"{'=' * 25}\n\n"
+                f"<b>Users:</b>\n"
+                f"  Active: {len(active_subs)}\n"
+                f"  Total: {len(subs)}\n\n"
+                f"<b>Watchers:</b>\n"
+                f"  Slots &amp; Casino: {sw_watching} {'ACTIVE' if slots_watcher.active else 'IDLE'}\n"
+                f"  Parallel: {pw_watching} {'ACTIVE' if pw.active else 'IDLE'}\n"
+                f"  Single: {single_watching} {'ACTIVE' if single_watcher.active else 'IDLE'}\n"
+                f"  Total watching: {total_watching}\n\n"
+                f"<b>Drops:</b>\n"
+                f"  Known channels: {known_channels}\n"
+                f"  Total polls: {total_polls}\n"
+                f"  Claimed rewards: {claimed}\n"
+                f"  History entries: {history_count}\n\n"
+                f"<b>Watchlist:</b>\n"
+                f"  Channels: {len(watchlist)}\n\n"
+                f"<b>Slots &amp; Casino:</b>\n"
+                f"  Live streamers: {len(slots_streamers)}\n"
+                f"  Cookie: {cookie_status}\n"
+                f"  Uptime: {fmt_duration(time.time() - BOT_START_TIME)}")
+        tg_send(msg, chat_id=chat_id)
+
+    elif cmd == "/uptime":
+        uptime = time.time() - BOT_START_TIME
+        days = int(uptime // 86400)
+        hours = int((uptime % 86400) // 3600)
+        mins = int((uptime % 3600) // 60)
+        tg_send(f"<b>Bot Uptime:</b>\n\n{days}d {hours}h {mins}m\n\nStarted: {datetime.fromtimestamp(BOT_START_TIME).strftime('%Y-%m-%d %H:%M')}", chat_id=chat_id)
+
+    elif cmd == "/users":
+        # Admin only: list all subscribers
+        if chat_id != ADMIN_ID:
+            tg_send("<b>Admin only command.</b>", chat_id=chat_id)
+            return
+        subs = load_subs()
+        if not subs:
+            tg_send("No subscribers.", chat_id=chat_id)
+            return
+        msg = f"<b>USERS ({len(subs)}):</b>\n\n"
+        for sid, data in subs.items():
+            status = "Active" if data.get("active", True) else "Inactive"
+            username = data.get("username", "?")
+            first_name = data.get("first_name", "?")
+            added = data.get("added_at", "?")[:10]
+            msg += f"  @{username} ({first_name})\n    ID: {sid} | {status} | {added}\n"
+        tg_send(msg, chat_id=chat_id)
+
+    elif cmd == "/ping":
+        start = time.time()
+        tg_send("Pong! Bot is responsive.", chat_id=chat_id)
+        elapsed = (time.time() - start) * 1000
+        log(f"[PING] Response time: {elapsed:.0f}ms")
 
 def _test_watch_loop(slug, channel_id, livestream_id, stop_event, duration_secs):
     """Test watch loop - watches for specified duration then stops."""
