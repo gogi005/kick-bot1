@@ -1670,6 +1670,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"<h1>401 Unauthorized</h1><p>Admin access only.</p>")
 
     def do_GET(self):
+        # HEALTH CHECK - no auth required, responds instantly
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+            return
+
         if not self._check_auth():
             self._send_auth_required()
             return
@@ -3038,6 +3046,16 @@ def main():
     log("=" * 50)
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
     log(f"Dashboard: port {DASHBOARD_PORT} (user: {DASH_USER})")
+    
+    # Self-ping thread: keeps Render free instance alive
+    def _self_ping():
+        import urllib.request as _req
+        while True:
+            time.sleep(240)  # Every 4 minutes
+            try:
+                _req.urlopen(f"http://127.0.0.1:{DASHBOARD_PORT}/health", timeout=10)
+            except: pass
+    threading.Thread(target=_self_ping, daemon=True).start()
     
     # Validate cookie on startup
     cookie = get_cookie()
