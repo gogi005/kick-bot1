@@ -471,8 +471,7 @@ def validate_cookie_and_get_user(cookie):
     """
     # Ensure cookie is decoded (| not %7C)
     try:
-        import urllib.parse
-        decoded = urllib.parse.unquote(cookie)
+        decoded = _urlparse.unquote(cookie)
     except:
         decoded = cookie
     
@@ -1906,8 +1905,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         raw_cookie = parts[1].strip()
         # Always decode cookie (if URL-encoded %7C → |)
         try:
-            import urllib.parse
-            cookie = urllib.parse.unquote(raw_cookie)
+            cookie = _urlparse.unquote(raw_cookie)
         except:
             cookie = raw_cookie
         tg_send("Validating cookie...", chat_id=chat_id)
@@ -2204,15 +2202,17 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         broadcast_msg = f"<b>📢 Message from Admin:</b>\n\n{safe_message}\n\n<i>Sent to {len(subs)} users</i>"
         sent_count = 0
         failed_count = 0
+        import urllib.request as _urllib_req
+        import urllib.error as _urllib_err
         for uid in subs:
             try:
                 payload = json.dumps({"chat_id": uid, "text": broadcast_msg, "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
-                req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=payload, method="POST")
+                req = _urllib_req.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=payload, method="POST")
                 req.add_header("Content-Type", "application/json")
-                urllib.request.urlopen(req, timeout=15)
+                _urllib_req.urlopen(req, timeout=15)
                 sent_count += 1
                 time.sleep(0.1)  # Rate limit protection - 100ms between sends
-            except urllib.error.HTTPError as e:
+            except _urllib_err.HTTPError as e:
                 failed_count += 1
                 log(f"[BROADCAST] Failed for {uid}: HTTP {e.code}")
             except Exception as e:
