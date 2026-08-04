@@ -26,14 +26,14 @@ except ImportError:
     HAS_TLS_CLIENT = False
     print("[INIT] tls_client NOT available - using urllib (bot detection likely)")
 
-# curl_cffi for WebSocket connections with Chrome TLS fingerprint
+# curl_cffi - OPTIONAL for WebSocket Chrome TLS fingerprint
 try:
     from curl_cffi.requests import AsyncSession as CurlAsyncSession
     HAS_CURL_CFFI = True
-    print("[INIT] curl_cffi available - WS connections will use Chrome 120 TLS")
+    print("[INIT] curl_cffi available")
 except ImportError:
     HAS_CURL_CFFI = False
-    print("[INIT] curl_cffi NOT available - WS will use websockets library")
+    print("[INIT] curl_cffi not available (not required)")
 
 # Supabase database module (persistent storage)
 try:
@@ -94,20 +94,11 @@ BASE_HEADERS = {
     "x-app-platform": "web",
 }
 
-# Cloudflare-compliant headers (mimics real Chrome browser)
+# Basic browser headers for HTTP requests
 BROWSER_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
 }
 
 def get_tls_session():
@@ -582,38 +573,58 @@ def try_claim_in_chat(username):
 
 def get_ws_token(session_token):
     """Get WebSocket viewer token using tls_client for Chrome TLS fingerprint.
-    This defeats Cloudflare JA3/JA4 detection on the token endpoint."""
+    MUST include session cookie + Bearer auth for drop tracking to work!
+    Matches kickautodrops pattern: cookies + Bearer + X-Client-Token."""
     s = get_tls_session()
     if s:
         try:
             # First visit kick.com to establish Cloudflare clearance cookies
             s.get("https://kick.com/", timeout_seconds=10)
             
-            token_headers = {
-                "Accept": "application/json, text/plain, */*",
-                "X-Client-Token": KICK_CLIENT_TOKEN,
-                "Referer": "https://kick.com/",
-                "Origin": "https://kick.com",
-            }
-            resp = s.get("https://websockets.kick.com/viewer/v1/token", 
-                         headers=token_headers, timeout_seconds=10)
+            # CRITICAL: Must include session cookie AND Bearer auth
+            # Without auth, the WS token won't track drop progress!
+            if session_token:
+                s.headers["Cookie"] = f"session={session_token}"
+                s.headers["Authorization"] = f"Bearer {session_token}"
+            s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+            s.headers["Accept"] = "application/json, text/plain, */*"
+            s.headers["Referer"] = "https://kick.com/"
+            s.headers["Origin"] = "https://kick.com"
+            s.headers["Sec-Fetch-Site"] = "same-site"
+            resp = s.get("https://websockets.kick.com/viewer/v1/token", timeout_seconds=10)
             if resp.status_code == 200:
-                token = resp.json().get("data", {}).get("token")
+                data = resp.json()
+                token = data.get("data", {}).get("token")
                 if token:
+                    print(f"[WS-TOKEN] Got token with auth ({len(token)} chars)")
                     return token
-            print(f"[WS-TOKEN] tls_client HTTP {resp.status_code}")
+                else:
+                    print(f"[WS-TOKEN] 200 but no token in response: {str(data)[:200]}")
+            else:
+                print(f"[WS-TOKEN] tls_client HTTP {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
             print(f"[WS-TOKEN] tls_client error: {e}")
     
-    # Fallback to urllib
+    # Fallback to urllib - MUST include Bearer auth
     try:
-        data = kick_request(WS_TOKEN_API, extra_headers={
-            "Authorization": f"Bearer {session_token}",
-            "X-Client-Token": KICK_CLIENT_TOKEN,
-            "Sec-Fetch-Site": "same-site",
-        })
-        return data.get("data", {}).get("token")
-    except: return None
+        headers = dict(BASE_HEADERS)
+        if session_token:
+            headers["Cookie"] = f"session={session_token}"
+            headers["Authorization"] = f"Bearer {session_token}"
+        headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+        headers["Sec-Fetch-Site"] = "same-site"
+        req = urllib.request.Request(WS_TOKEN_API)
+        for k, v in headers.items():
+            req.add_header(k, v)
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = json.loads(resp.read().decode())
+        token = data.get("data", {}).get("token")
+        if token:
+            print(f"[WS-TOKEN] Got token via urllib with auth ({len(token)} chars)")
+        return token
+    except Exception as e:
+        print(f"[WS-TOKEN] urllib error: {e}")
+        return None
 
 def get_session_token(user_id=None):
     """Return decoded cookie as Bearer token"""
@@ -958,72 +969,50 @@ async def send_user_event(ws, channel_id, livestream_id, session=None):
         "channel_id": channel_id,
         "livestream_id": int(ls_id) if str(ls_id).isdigit() else ls_id,
     }}}
-    await curl_ws_send(ws, json.dumps(event), session)
+    await ws_send(ws, json.dumps(event), session)
 
 # ============================================================
 #  CURL_CFFI WEBSOCKET HELPER - Chrome TLS fingerprint
 # ============================================================
-async def curl_ws_connect(ws_url, headers, user_id=None):
-    """Connect to WebSocket matching kickautodrops/KickDropsMiner pattern.
-    Uses websockets library with Chrome-compatible headers.
+async def ws_connect(ws_url, headers, user_id=None):
+    """Connect to WebSocket for Kick.com drop tracking.
+    Uses plain websockets library - simple and reliable.
     Session cookie included for authenticated drop tracking."""
     cookie = get_cookie(user_id)
     ws_headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Origin": "https://kick.com",
         "Referer": "https://kick.com/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not-A.Brand";v="99"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
     }
     if cookie:
-        ws_headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}; session_token={cookie}"
+        # CRITICAL: Kick.com session cookie is named 'session' NOT 'session_token'!
+        ws_headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}; session={cookie}"
+        ws_headers["Authorization"] = f"Bearer {cookie}"
     else:
         ws_headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
     headers.update(ws_headers)
     
-    if HAS_CURL_CFFI:
-        try:
-            session = CurlAsyncSession(impersonate="chrome120")
-            ws = await session.ws_connect(ws_url, headers=ws_headers)
-            return ws, session
-        except Exception as e:
-            print(f"[WS] curl_cffi connect error: {e}")
-    # websockets library with generous auto-ping for keepalive
-    # Kick server pong responses can be slow (~19s), so ping_timeout must be >20s
+    # Plain websockets library - works reliably
     import websockets
-    ws = await websockets.connect(ws_url, additional_headers=ws_headers, ping_interval=25, ping_timeout=30)
-    return ws, None
+    ws = await websockets.connect(ws_url, additional_headers=ws_headers)
+    return ws, None  # Return (ws, session) tuple for compatibility
 
-async def curl_ws_send(ws, data, session=None):
-    """Send message via curl_cffi or websockets WS."""
-    if HAS_CURL_CFFI and session:
-        await ws.send(data)
-    else:
-        await ws.send(data)
+async def ws_send(ws, data, session=None):
+    """Send message via WebSocket."""
+    await ws.send(data)
 
-async def curl_ws_recv(ws, session=None, timeout=1.0):
+async def ws_recv(ws, session=None, timeout=1.0):
     """Receive message from WS with timeout."""
-    if HAS_CURL_CFFI and session:
-        try:
-            msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
-            return msg
-        except:
-            return None
-    else:
-        import websockets
-        try:
-            msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
-            return msg
-        except:
-            return None
+    try:
+        msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
+        return msg
+    except:
+        return None
+
+# Keep old function names as aliases for backward compatibility
+curl_ws_connect = ws_connect
+curl_ws_send = ws_send
+curl_ws_recv = ws_recv
 
 def fmt_duration(seconds):
     h = int(seconds) // 3600
