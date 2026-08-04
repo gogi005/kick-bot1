@@ -1,5 +1,4 @@
-"""
-Kick Stake Drops Bot v25 - TIME WINDOW + TEST MODE
+"""Kick Stake Drops Bot v28 - SIMPLE WEBSOCKETS + AUTH FIX
 - ACTIVE HOURS: 2 AM to 11 AM IST (auto watch)
 - POLLING: 24/7 every 5 seconds (always detects new drops)
 - MANUAL: /watchtest works 24/7
@@ -26,14 +25,14 @@ except ImportError:
     HAS_TLS_CLIENT = False
     print("[INIT] tls_client NOT available - using urllib (bot detection likely)")
 
-# curl_cffi - OPTIONAL for WebSocket Chrome TLS fingerprint
+# curl_cffi for WebSocket Chrome TLS fingerprint (REQUIRED for watch time counting)
 try:
     from curl_cffi.requests import AsyncSession as CurlAsyncSession
     HAS_CURL_CFFI = True
-    print("[INIT] curl_cffi available")
+    print("[INIT] curl_cffi available - WebSocket will use Chrome 120 TLS")
 except ImportError:
     HAS_CURL_CFFI = False
-    print("[INIT] curl_cffi not available (not required)")
+    print("[INIT] curl_cffi NOT available - WebSocket may not count watch time!")
 
 # Supabase database module (persistent storage)
 try:
@@ -976,13 +975,24 @@ async def send_user_event(ws, channel_id, livestream_id, session=None):
 # ============================================================
 async def ws_connect(ws_url, headers, user_id=None):
     """Connect to WebSocket for Kick.com drop tracking.
-    Uses plain websockets library - simple and reliable.
-    Session cookie included for authenticated drop tracking."""
+    Uses curl_cffi with Chrome 120 TLS fingerprint (REQUIRED for watch time).
+    Falls back to plain websockets if curl_cffi unavailable."""
     cookie = get_cookie(user_id)
     ws_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
         "Origin": "https://kick.com",
         "Referer": "https://kick.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
     }
     if cookie:
         # CRITICAL: Kick.com session cookie is named 'session' NOT 'session_token'!
@@ -992,10 +1002,21 @@ async def ws_connect(ws_url, headers, user_id=None):
         ws_headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
     headers.update(ws_headers)
     
-    # Plain websockets library - works reliably
+    # curl_cffi with Chrome 120 TLS fingerprint (REQUIRED for watch time counting)
+    if HAS_CURL_CFFI:
+        try:
+            session = CurlAsyncSession(impersonate="chrome120")
+            ws = await session.ws_connect(ws_url, headers=ws_headers)
+            print("[WS] Connected with Chrome 120 TLS fingerprint")
+            return ws, session
+        except Exception as e:
+            print(f"[WS] curl_cffi error: {e}")
+    
+    # Fallback to plain websockets (may not count watch time)
+    print("[WS] WARNING: Using plain websockets - watch time may not count!")
     import websockets
     ws = await websockets.connect(ws_url, additional_headers=ws_headers)
-    return ws, None  # Return (ws, session) tuple for compatibility
+    return ws, None
 
 async def ws_send(ws, data, session=None):
     """Send message via WebSocket."""
@@ -1008,6 +1029,11 @@ async def ws_recv(ws, session=None, timeout=1.0):
         return msg
     except:
         return None
+
+# Keep old function names as aliases for backward compatibility
+curl_ws_connect = ws_connect
+curl_ws_send = ws_send
+curl_ws_recv = ws_recv
 
 # Keep old function names as aliases for backward compatibility
 curl_ws_connect = ws_connect
@@ -3418,10 +3444,10 @@ def poller():
 def main():
     global COOKIE_VALIDATED
     log("=" * 50)
-    log("KICK STAKE DROPS BOT v27 - CURL_CFFI WS + CHROME TLS")
+    log("KICK STAKE DROPS BOT v29 - CURL_CFFI WS + AUTH FIX")
     log("=" * 50)
-    log(f"tls_client: {'Chrome 120 fingerprint ACTIVE' if HAS_TLS_CLIENT else 'DISABLED'}")
-    log(f"curl_cffi WS: {'Chrome 120 TLS ACTIVE' if HAS_CURL_CFFI else 'DISABLED (websockets fallback)'}")
+    log(f"tls_client: {'ACTIVE (HTTP bypass)' if HAS_TLS_CLIENT else 'DISABLED'}")
+    log(f"curl_cffi WS: {'Chrome 120 TLS ACTIVE' if HAS_CURL_CFFI else 'DISABLED (watch time may not count!)'}")
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
     log(f"Dashboard: port {DASHBOARD_PORT} (user: {DASH_USER})")
     
