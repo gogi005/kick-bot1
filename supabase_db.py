@@ -27,16 +27,29 @@ def get_client():
                 _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _supabase
 
-def _retry(func, max_retries=3, delay=1):
-    """Retry function on Windows socket errors"""
+def _retry(func, max_retries=5, delay=2):
+    """Retry function on socket errors (Windows + Linux)"""
     for i in range(max_retries):
         try:
             return func()
         except Exception as e:
             err_str = str(e).lower()
-            if 'non-blocking' in err_str or 'winerror' in err_str or '10035' in err_str:
+            # Windows: non-blocking socket, WSAEWOULDBLOCK (10035)
+            # Linux: [Errno 11] Resource temporarily unavailable (EAGAIN/EWOULDBLOCK)
+            is_socket_err = (
+                'non-blocking' in err_str or
+                'winerror' in err_str or
+                '10035' in err_str or
+                'errno 11' in err_str or
+                'resource temporarily unavailable' in err_str or
+                'eagain' in err_str or
+                'ewouldblock' in err_str
+            )
+            if is_socket_err:
                 if i < max_retries - 1:
-                    time.sleep(delay)
+                    wait = delay * (i + 1)  # Exponential backoff
+                    print(f"[DB] Socket error (attempt {i+1}/{max_retries}), retrying in {wait}s: {str(e)[:80]}")
+                    time.sleep(wait)
                     continue
             raise
 
