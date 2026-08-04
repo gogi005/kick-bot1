@@ -592,16 +592,17 @@ def get_ws_token(session_token):
             
             # Step 3: Get WS token (with all cookies including cf_clearance)
             resp = s.get("https://websockets.kick.com/viewer/v1/token", timeout_seconds=10)
+            print(f"[WS-TOKEN] Response: {resp.status_code}")
             if resp.status_code == 200:
                 data = resp.json()
                 token = data.get("data", {}).get("token")
                 if token:
-                    print(f"[WS-TOKEN] Got token ({len(token)} chars)")
+                    print(f"[WS-TOKEN] Got token ({len(token)} chars): {token[:30]}...")
                     return token
                 else:
-                    print(f"[WS-TOKEN] 200 but no token: {str(data)[:200]}")
+                    print(f"[WS-TOKEN] 200 but no token: {str(data)[:300]}")
             else:
-                print(f"[WS-TOKEN] HTTP {resp.status_code}: {resp.text[:200]}")
+                print(f"[WS-TOKEN] HTTP {resp.status_code}: {resp.text[:300]}")
         except Exception as e:
             print(f"[WS-TOKEN] tls_client error: {e}")
     
@@ -2438,13 +2439,22 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             tg_send(f"<b>DEBUG:</b>\nCookie: {len(cookie)} chars\nWS Token: <b>FAILED</b>\n\nCookie may be expired!", chat_id=chat_id)
             return
         
-        # Test channel info
-        info = get_channel_info("kick")
-        if not info:
-            tg_send(f"<b>DEBUG:</b>\nCookie: OK ({len(cookie)} chars)\nWS Token: OK ({len(ws_token)} chars)\nChannel API: FAILED", chat_id=chat_id)
-            return
+        # Check token length
+        token_ok = len(ws_token) > 50
+        token_warn = "\n\n⚠️ Token too short! May be invalid." if not token_ok else ""
         
-        tg_send(f"<b>DEBUG OK:</b>\nCookie: {len(cookie)} chars\nWS Token: {len(ws_token)} chars\nChannel: {info.get('username')} (live: {info.get('is_live')})\n\nTry /watchtest kick now!", chat_id=chat_id)
+        # Test with a live channel (use slots streamers)
+        slots = get_slots_streamers()
+        test_channel = slots[0]["username"] if slots else None
+        
+        if test_channel:
+            info = get_channel_info(test_channel)
+            if info and info.get("is_live"):
+                tg_send(f"<b>DEBUG:</b>\nCookie: {len(cookie)} chars\nWS Token: {len(ws_token)} chars {'✅' if token_ok else '❌'}\nTest Channel: @{test_channel} (live: ✅)\n\nTry /watchtest {test_channel}", chat_id=chat_id)
+            else:
+                tg_send(f"<b>DEBUG:</b>\nCookie: {len(cookie)} chars\nWS Token: {len(ws_token)} chars {'✅' if token_ok else '❌'}\nTest Channel: @{test_channel} (offline){token_warn}", chat_id=chat_id)
+        else:
+            tg_send(f"<b>DEBUG:</b>\nCookie: {len(cookie)} chars\nWS Token: {len(ws_token)} chars {'✅' if token_ok else '❌'}\nNo live channels found{token_warn}", chat_id=chat_id)
     
     elif cmd == "/watchtest":
         parts = text.split()
