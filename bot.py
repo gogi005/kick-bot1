@@ -127,8 +127,14 @@ import urllib.parse as _urlparse
 
 # Priority: User-specific > Admin env var > Supabase global > local file
 def get_cookie(user_id=None):
-    """Get cookie DECODED: user cookie > admin env cookie > Supabase > file"""
+    """Get cookie DECODED: user-specific > Supabase global > env var > file
+    
+    Per-user cookie logic:
+    - If user_id provided: check if that user has a cookie set via /setcookie
+    - If no user_id or no user cookie: fall back to global/env cookie
+    """
     raw = ""
+    
     # 1. User-specific cookie (if user called /setcookie)
     if user_id and USE_SUPABASE:
         try:
@@ -138,17 +144,17 @@ def get_cookie(user_id=None):
         except Exception as e:
             print(f"[DB] get_user_cookie error: {e}")
     
-    # 2. Admin env var cookie (KICK_COOKIE) — ALWAYS use this as default
-    if not raw and INITIAL_COOKIE:
-        raw = INITIAL_COOKIE
-    
-    # 3. Supabase global cookie (old fallback)
+    # 2. Supabase global cookie (fallback)
     if not raw and USE_SUPABASE:
         try:
             c = db.load_cookie_db()
             if c: raw = c
         except Exception as e:
             print(f"[DB] get_cookie fallback: {e}")
+    
+    # 3. Admin env var cookie (KICK_COOKIE) — fallback only
+    if not raw and INITIAL_COOKIE:
+        raw = INITIAL_COOKIE
     
     # 4. Local file
     if not raw and os.path.exists(COOKIE_FILE):
@@ -308,9 +314,9 @@ def kick_request(url, extra_headers=None, timeout=15, user_id=None):
     except urllib.error.HTTPError as e:
         raise
 
-def fetch_campaigns():
+def fetch_campaigns(user_id=None):
     try:
-        data = kick_request(DROPS_API)
+        data = kick_request(DROPS_API, user_id=user_id)
         return data.get("data", []), True
     except urllib.error.HTTPError as e:
         if e.code in (401, 403): return None, False
@@ -571,11 +577,12 @@ def get_slots_streamers():
         return result
     except: return []
 
-def smart_claim_check(username=None):
-    """Smart claim check - progress is RATIO (0-1), not seconds"""
+def smart_claim_check(username=None, user_id=None):
+    """Smart claim check - progress is RATIO (0-1), not seconds.
+    Uses user's cookie if user_id provided."""
     global _progress_cache
     try:
-        progress = fetch_progress()
+        progress = fetch_progress(user_id=user_id)
         if not progress: return
         claimed_any = False
         for item in progress:
@@ -589,7 +596,7 @@ def smart_claim_check(username=None):
                 claim_key = f"{campaign_id}_{reward_id}"
                 if required > 0 and ratio >= 1.0:
                     log(f"[CLAIM] CLAIMABLE! {total_progress}/{required}s (ratio={ratio})")
-                    result = claim_reward(campaign_id, reward_id)
+                    result = claim_reward(campaign_id, reward_id, user_id=user_id)
                     if result:
                         claimed_any = True
                         tg_send(f"<b>🎉 REWARD CLAIMED!</b>\nStreamer: @{username or '?'}\nCampaign: ATK Drop\nReward: {r.get('name', reward_id[:16])}")
@@ -884,7 +891,8 @@ class SingleWatcher:
         self.started_at = None
 
     def start(self, chat_id, usernames):
-        """Start watching multiple streamers simultaneously"""
+        """Start watching multiple streamers simultaneously.
+        Uses user's cookie if they set one via /setcookie."""
         if isinstance(usernames, str):
             usernames = [usernames]
 
@@ -896,14 +904,14 @@ class SingleWatcher:
             if username in self.watchers:
                 failed.append(f"@{username} (already watching)")
                 continue
-            info = get_channel_info(username)
+            info = get_channel_info(username)  # Uses user's cookie via get_cookie(chat_id)
             if not info:
                 failed.append(f"@{username} (not found)")
                 continue
             if not info.get("is_live"):
                 failed.append(f"@{username} (offline)")
                 continue
-            watcher = SingleStreamWatcher(username, info["channel_id"], info.get("livestream_id"), self)
+            watcher = SingleStreamWatcher(username, info["channel_id"], info.get("livestream_id"), self, user_id=chat_id)
             with self._lock:
                 self.watchers[username] = watcher
                 self.active = True
@@ -974,11 +982,12 @@ class SingleWatcher:
 
 
 class SingleStreamWatcher:
-    def __init__(self, username, channel_id, livestream_id, parent):
+    def __init__(self, username, channel_id, livestream_id, parent, user_id=None):
         self.username = username
         self.channel_id = channel_id
         self.livestream_id = livestream_id
         self.parent = parent
+        self.user_id = user_id  # Per-user cookie support
         self.stop_event = threading.Event()
         self.started_at = datetime.now()
         self.watch_time = 0
@@ -1003,7 +1012,7 @@ class SingleStreamWatcher:
             self.parent.on_watcher_done(self.username)
 
     def _ws_connect(self):
-        ws_token = get_ws_token(get_cookie())
+        ws_token = get_ws_token(get_cookie(self.user_id))  # Use user's cookie
         if not ws_token: raise Exception("No WS token")
         ws_url = WS_URL_TEMPLATE.format(token=ws_token)
         headers = dict(BASE_HEADERS)
@@ -1045,7 +1054,7 @@ class SingleStreamWatcher:
                         self.watch_time += 60
                     last_ue = now
                     if elapsed_since_start >= 60:
-                        smart_claim_check(username)
+                        smart_claim_check(username, user_id=self.user_id)
                     log(f"[WATCH] event #{self.events_sent} @{username} ({fmt_duration(self.watch_time)})")
                 if now - last_refresh >= 300:
                     last_refresh = now
@@ -1313,6 +1322,214 @@ class StreamWatcher:
 pw = ParallelWatcher()
 
 # ============================================================
+#  SLOTS WATCHER (Admin /watchnow)
+# ============================================================
+class SlotsWatcher:
+    """Admin command: Watch all Slots & Casino streamers continuously.
+    - Max 10 at a time
+    - Each for 2-3 minutes (random)
+    - Cycles through all live streamers
+    - Stops only with /watchstop"""
+    
+    def __init__(self):
+        self.active = False
+        self.stop_event = threading.Event()
+        self.main_thread = None
+        self.watching = {}  # username -> {thread, stop_event, started_at}
+        self._lock = threading.Lock()
+        self.total_watched = 0
+        self.total_claims = 0
+    
+    def start(self, chat_id=None):
+        if self.active:
+            return False, "Already running! /watchstop to stop."
+        self.active = True
+        self.stop_event.clear()
+        self.total_watched = 0
+        self.total_claims = 0
+        self.main_thread = threading.Thread(target=self._run, args=(chat_id,), daemon=True)
+        self.main_thread.start()
+        log("[SW] Slots Watcher started")
+        return True, "<b>🎰 SLOTS WATCHER STARTED!</b>\n\nWatching all live Slots & Casino streamers.\nMax 10 at a time, 2-3 min each.\n/watchstop to stop."
+    
+    def stop(self):
+        if not self.active:
+            return False, "Not running!"
+        self.active = False
+        self.stop_event.set()
+        with self._lock:
+            for username, info in self.watching.items():
+                info["stop_event"].set()
+            self.watching.clear()
+        msg = (f"<b>🎰 SLOTS WATCHER STOPPED!</b>\n\n"
+               f"Watched: {self.total_watched}\n"
+               f"Claims: {self.total_claims}")
+        log(f"[SW] Stopped. Watched: {self.total_watched}, Claims: {self.total_claims}")
+        return True, msg
+    
+    def get_status(self):
+        if not self.active:
+            return "<b>SLOTS WATCHER: IDLE</b>\n\nUse /watchnow to start."
+        with self._lock:
+            watching = list(self.watching.keys())
+        return (f"<b>SLOTS WATCHER: ACTIVE</b>\n\n"
+                f"Watching ({len(watching)}):\n" +
+                "\n".join([f"  @{u}" for u in watching[:10]]) +
+                f"\n\nTotal watched: {self.total_watched}\n"
+                f"Claims: {self.total_claims}\n"
+                f"/watchstop to stop")
+    
+    def _run(self, chat_id):
+        """Main loop: fetch slots streamers, watch max10, repeat."""
+        while self.active and not self.stop_event.is_set():
+            try:
+                # Get live Slots & Casino streamers
+                streamers = get_slots_streamers()
+                if not streamers:
+                    log("[SW] No Slots & Casino streamers found, waiting 30s...")
+                    self._wait(30)
+                    continue
+                
+                log(f"[SW] Found {len(streamers)} Slots & Casino streamers")
+                
+                # Filter out already watching
+                to_watch = []
+                for s in streamers:
+                    username = s.get("username")
+                    if username and username not in self.watching:
+                        to_watch.append(s)
+                
+                if not to_watch:
+                    log("[SW] All already watching, waiting 30s...")
+                    self._wait(30)
+                    continue
+                
+                # Start watching max10 at a time
+                batch = to_watch[:10]
+                for s in batch:
+                    if self.stop_event.is_set():
+                        break
+                    username = s["username"]
+                    cid = s.get("channel_id")
+                    lsid = s.get("livestream_id")
+                    
+                    # Random watch time: 2-3 minutes
+                    watch_seconds = random.randint(120, 180)
+                    
+                    stop_evt = threading.Event()
+                    t = threading.Thread(
+                        target=self._watch_one,
+                        args=(username, cid, lsid, watch_seconds, stop_evt),
+                        daemon=True
+                    )
+                    
+                    with self._lock:
+                        self.watching[username] = {
+                            "stop_event": stop_evt,
+                            "started_at": time.time(),
+                            "watch_seconds": watch_seconds,
+                        }
+                    
+                    t.start()
+                    self.total_watched += 1
+                    log(f"[SW] Watching @{username} for {watch_seconds}s")
+                    time.sleep(0.5)  # Stagger connections
+                
+                if chat_id:
+                    tg_send(f"<b>🎰 Batch:</b> Watching {len(batch)} streamers ({', '.join(['@'+s['username'] for s in batch[:5]])}{'...' if len(batch)>5 else ''})", chat_id=chat_id)
+                
+                # Wait for batch to finish (check every 10s)
+                self._wait(10)
+                
+            except Exception as e:
+                log(f"[SW] Error: {e}")
+                self._wait(10)
+        
+        log("[SW] Slots Watcher stopped")
+    
+    def _watch_one(self, username, channel_id, livestream_id, target_seconds, stop_event):
+        """Watch a single streamer for target_seconds."""
+        try:
+            # Wait for our turn (stagger starts)
+            self._wait(random.randint(1, 5))
+            if stop_event.is_set(): return
+            
+            # Connect via WebSocket
+            ws_token = get_ws_token(get_cookie())
+            if not ws_token:
+                log(f"[SW] No WS token for @{username}")
+                return
+            
+            ws_url = WS_URL_TEMPLATE.format(token=ws_token)
+            headers = dict(BASE_HEADERS)
+            
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._ws_loop(ws_url, headers, username, channel_id, livestream_id, stop_event, target_seconds))
+            finally:
+                loop.close()
+            
+        except Exception as e:
+            log(f"[SW] Error @{username}: {e}")
+        finally:
+            with self._lock:
+                self.watching.pop(username, None)
+            log(f"[SW] Done @{username}")
+    
+    async def _ws_loop(self, ws_url, headers, username, channel_id, livestream_id, stop_event, target_seconds):
+        """WebSocket loop: send events every 60s until target reached."""
+        ls_id = livestream_id or channel_id
+        
+        async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+            # Handshake
+            await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
+            try: await asyncio.wait_for(ws.recv(), timeout=5)
+            except: pass
+            
+            # Send first user event
+            await send_user_event(ws, channel_id, ls_id)
+            log(f"[SW] Connected @{username}")
+            
+            start = time.time()
+            last_ue = time.time()
+            last_ping = time.time()
+            
+            while not stop_event.is_set():
+                now = time.time()
+                elapsed = now - start
+                
+                if elapsed >= target_seconds:
+                    log(f"[SW] @{username} done ({int(elapsed)}s)")
+                    return
+                
+                # Ping every 20s
+                if now - last_ping >= 20:
+                    try:
+                        await ws.send(json.dumps({"type": "ping"}))
+                        last_ping = now
+                        try: await asyncio.wait_for(ws.recv(), timeout=3)
+                        except: pass
+                    except: pass
+                
+                # User event every 60s
+                if now - last_ue >= 60:
+                    await send_user_event(ws, channel_id, ls_id)
+                    last_ue = now
+                    remaining = int(target_seconds - elapsed)
+                    log(f"[SW] @{username} event ({remaining}s left)")
+                
+                await asyncio.sleep(1)
+    
+    def _wait(self, seconds):
+        """Wait, checking stop_event periodically."""
+        end = time.time() + seconds
+        while time.time() < end and not self.stop_event.is_set():
+            time.sleep(1)
+
+slots_watcher = SlotsWatcher()
+
+# ============================================================
 #  DASHBOARD (Password Protected)
 # ============================================================
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -1456,12 +1673,14 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             "/status - Bot status\n\n"
             "<b>MANUAL WATCH:</b>\n"
             "/watchtest &lt;user1&gt; [user2] - Watch streams\n"
-            "/watchstop - Stop\n"
+            "/watchstop - Stop all watchers\n"
             "/watchstatus - Watch info\n"
+            "/watchnow - Admin: watch Slots & Casino 24/7\n"
             "/startwatching - Test: watch all known live (1 hour)\n\n"
             "<b>CONFIG:</b>\n"
             "/setcookie - Update cookie\n"
             "/checkcookie - Check if cookie is valid\n"
+            "/mycookie - Admin: see current cookie\n"
             "/stop - Unsubscribe\n"
             "/help - This",
             chat_id=chat_id)
@@ -1503,7 +1722,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         for i in range(0, len(msg), 4000): tg_send(msg[i:i+4000], chat_id=chat_id)
 
     elif cmd == "/stake":
-        campaigns, _ = fetch_campaigns()
+        campaigns, _ = fetch_campaigns(user_id=chat_id)
         if not campaigns: tg_send("API unavailable.", chat_id=chat_id); return
         stake = [c for c in campaigns if is_stake_drop(c)]
         if not stake: tg_send(f"No Stake drops. Total: {len(campaigns)}", chat_id=chat_id); return
@@ -1514,7 +1733,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
     elif cmd == "/live":
         tg_send("Checking...", chat_id=chat_id)
         try:
-            data = kick_request("https://web.kick.com/api/v1/livestreams?limit=100&sort=viewer_count")
+            data = kick_request("https://web.kick.com/api/v1/livestreams?limit=100&sort=viewer_count", user_id=chat_id)
             streams = data.get("data", [])
             live_stake = []
             for s in streams:
@@ -1602,6 +1821,54 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             COOKIE_VALIDATED = False
             tg_send(f"<b>🔴 Cookie INVALID/EXPIRED!</b>\n\nUse /setcookie with a fresh cookie.\n\n<i>How to get cookie:</i>\n1. Open kick.com in browser\n2. Login to your account\n3. Press F12 → Application → Cookies\n4. Copy the 'session' cookie value", chat_id=chat_id)
 
+    elif cmd == "/mycookie":
+        # Admin-only: show which cookie is being used
+        if chat_id != ADMIN_ID:
+            tg_send("⛔ Admin only command.", chat_id=chat_id)
+            return
+        
+        cookie = get_cookie()
+        if not cookie:
+            tg_send("<b>🔴 NO COOKIE SET!</b>\n\nUse /setcookie to add one.", chat_id=chat_id)
+            return
+        
+        # Determine source
+        source = "Unknown"
+        if INITIAL_COOKIE and get_cookie() == urllib.parse.unquote(INITIAL_COOKIE):
+            source = "🌐 ENV VAR (KICK_COOKIE)"
+        elif USE_SUPABASE:
+            try:
+                user_data = db.get_user_cookie(ADMIN_ID)
+                if user_data and user_data.get("cookie"):
+                    source = "👤 ADMIN USER COOKIE (Supabase)"
+                else:
+                    global_cookie = db.load_cookie_db()
+                    if global_cookie:
+                        source = "🌍 GLOBAL COOKIE (Supabase)"
+                    else:
+                        source = " ENV VAR (KICK_COOKIE)"
+            except:
+                source = "ENV VAR (KICK_COOKIE)"
+        elif os.path.exists(COOKIE_FILE):
+            source = "📁 LOCAL FILE"
+        
+        # Validate
+        valid, username, user_id = validate_cookie_and_get_user(cookie)
+        status = "✅ VALID" if valid else "❌ INVALID/EXPIRED"
+        kick_user = f"@{username}" if username and valid else "N/A"
+        
+        # Mask cookie (show first 10 + last 5 chars)
+        masked = cookie[:10] + "..." + cookie[-5:] if len(cookie) > 15 else cookie[:5] + "..."
+        
+        msg = (f"<b>🔑 ADMIN COOKIE STATUS</b>\n\n"
+               f"<b>Source:</b> {source}\n"
+               f"<b>Status:</b> {status}\n"
+               f"<b>Kick User:</b> {kick_user}\n"
+               f"<b>Length:</b> {len(cookie)} chars\n"
+               f"<b>Preview:</b> <code>{masked}</code>\n\n"
+               f"<i>Cookie priority: User > ENV > Supabase > File</i>")
+        tg_send(msg, chat_id=chat_id)
+
     elif cmd == "/addchannel":
         parts = text.split()
         if len(parts) < 2: tg_send("Usage: /addchannel &lt;username&gt;\nExample: /addchannel stake", chat_id=chat_id); return
@@ -1663,11 +1930,27 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         tg_send(msg, chat_id=chat_id)
 
     elif cmd == "/watchstop":
-        success, msg = single_watcher.stop(reason="user stopped")
+        # Stop both SingleWatcher and SlotsWatcher
+        msgs = []
+        s, m = single_watcher.stop(reason="user stopped")
+        if s: msgs.append(m)
+        s, m = slots_watcher.stop()
+        if s: msgs.append(m)
+        if not msgs:
+            msgs.append("Nothing to stop.")
+        tg_send("\n\n".join(msgs), chat_id=chat_id)
+
+    elif cmd == "/watchnow":
+        # Admin only: watch all Slots & Casino streamers
+        if chat_id != ADMIN_ID:
+            tg_send("⛔ Admin only command.", chat_id=chat_id)
+            return
+        success, msg = slots_watcher.start(chat_id=chat_id)
         tg_send(msg, chat_id=chat_id)
 
     elif cmd == "/watchstatus":
-        tg_send(single_watcher.get_status(), chat_id=chat_id)
+        msg = single_watcher.get_status() + "\n\n" + slots_watcher.get_status()
+        tg_send(msg, chat_id=chat_id)
 
     elif cmd == "/startwatching":
         # Test command: watch all known live streamers for 1 hour
