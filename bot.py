@@ -131,13 +131,14 @@ def load_logs():
 # ---- Cookie ----
 import urllib.parse as _urlparse
 
-# Priority: User-specific > Admin env var > Supabase global > local file
+# Priority: User-specific > ENV var KICK_COOKIE
 def get_cookie(user_id=None):
-    """Get cookie DECODED: user-specific > Supabase global > env var > file
+    """Get cookie DECODED: user-specific (from /setcookie) > ENV var KICK_COOKIE
     
-    Per-user cookie logic:
-    - If user_id provided: check if that user has a cookie set via /setcookie
-    - If no user_id or no user cookie: fall back to global/env cookie
+    Simple logic:
+    - If user has set cookie via /setcookie: use THEIR cookie
+    - Otherwise: use admin ENV var KICK_COOKIE
+    No more Supabase global or local file fallback!
     """
     raw = ""
     
@@ -147,31 +148,19 @@ def get_cookie(user_id=None):
             user_data = db.get_user_cookie(user_id)
             if user_data and user_data.get("cookie"):
                 raw = user_data["cookie"]
+                print(f"[COOKIE] Using user {user_id} cookie ({len(raw)} chars)")
         except Exception as e:
             print(f"[DB] get_user_cookie error: {e}")
     
-    # 2. Supabase global cookie (fallback)
-    if not raw and USE_SUPABASE:
-        try:
-            c = db.load_cookie_db()
-            if c: raw = c
-        except Exception as e:
-            print(f"[DB] get_cookie fallback: {e}")
-    
-    # 3. Admin env var cookie (KICK_COOKIE) — fallback only
+    # 2. ENV var KICK_COOKIE (fallback - admin cookie)
     if not raw and INITIAL_COOKIE:
         raw = INITIAL_COOKIE
-    
-    # 4. Local file
-    if not raw and os.path.exists(COOKIE_FILE):
-        try:
-            with open(COOKIE_FILE) as f:
-                raw = json.load(f).get("cookie", "")
-        except: pass
+        print(f"[COOKIE] Using ENV var KICK_COOKIE ({len(raw)} chars)")
     
     # ALWAYS decode: %7C → | (Kick needs decoded cookie)
     if raw:
         return _urlparse.unquote(raw)
+    print("[COOKIE] NO COOKIE FOUND! Use /setcookie or set KICK_COOKIE env var")
     return ""
 
 def save_cookie(cookie):
@@ -1194,7 +1183,13 @@ class SingleStreamWatcher:
                         return
                 await asyncio.sleep(1)
 
-single_watcher = SingleWatcher()
+# Per-user watchers: each user gets their own SingleWatcher
+single_watchers = {}  # user_id -> SingleWatcher
+def get_single_watcher(user_id):
+    """Get or create SingleWatcher for specific user"""
+    if user_id not in single_watchers:
+        single_watchers[user_id] = SingleWatcher()
+    return single_watchers[user_id]
 
 # ============================================================
 #  PARALLEL WATCHER
@@ -1709,8 +1704,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pw_c = "#4CAF50" if pw.active else "#999"
         watching = pw.state.get("watching", {})
         w_list = ", ".join([f"@{u}" for u in watching]) or "None"
-        sw_s = "ACTIVE" if single_watcher.active else "IDLE"
-        sw_users = ", ".join([f"@{u}" for u in single_watcher.watchers.keys()]) or "None"
+        sw_s = "ACTIVE" if any(sw.active for sw in single_watchers.values()) else "IDLE"
+        sw_users = ", ".join([f"@{u}" for sw in single_watchers.values() for u in sw.watchers.keys()]) or "None"
         dh_s = "ACTIVE" if drop_hunter.active else "STOPPED"
         dh_c = "#4CAF50" if drop_hunter.active else "#999"
         dh_watching = len(drop_hunter.watching_channels)
@@ -1898,7 +1893,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         for i in range(0, len(msg), 4000): tg_send(msg[i:i+4000], chat_id=chat_id)
 
     elif cmd == "/status":
-        tg_send(f"Polls: {load_state().get('polls',0)}\nDrops: {len(load_state().get('known',{}))}\nSubs: {len(get_active_subs())}\nPW: {'ON' if pw.active else 'OFF'}\nSW: {'ON' if single_watcher.active else 'OFF'}", chat_id=chat_id)
+        tg_send(f"Polls: {load_state().get('polls',0)}\nDrops: {len(load_state().get('known',{}))}\nSubs: {len(get_active_subs())}\nPW: {'ON' if pw.active else 'OFF'}\nSW: {'ON' if any(sw.active for sw in single_watchers.values()) else 'OFF'}", chat_id=chat_id)
 
     elif cmd == "/setcookie":
         parts = text.split(maxsplit=1)
@@ -1964,30 +1959,14 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             tg_send("<b>🔴 NO COOKIE SET!</b>\n\nUse /setcookie to add one.", chat_id=chat_id)
             return
         
-        # Determine source - match get_cookie() priority order
-        source = "Unknown"
+        # Determine source - simple: user cookie OR env var
+        source = "🌐 ENV VAR (KICK_COOKIE)"
         if USE_SUPABASE:
             try:
-                # 1. Check admin user cookie first (highest priority)
                 user_data = db.get_user_cookie(ADMIN_ID)
                 if user_data and user_data.get("cookie") and _urlparse.unquote(user_data["cookie"]) == cookie:
-                    source = "👤 ADMIN USER COOKIE (Supabase)"
-                else:
-                    # 2. Check global cookie
-                    global_cookie = db.load_cookie_db()
-                    if global_cookie and _urlparse.unquote(global_cookie) == cookie:
-                        source = "🌍 GLOBAL COOKIE (Supabase)"
-                    # 3. Check env var
-                    elif INITIAL_COOKIE and _urlparse.unquote(INITIAL_COOKIE) == cookie:
-                        source = "🌐 ENV VAR (KICK_COOKIE)"
-                    else:
-                        source = "🌍 GLOBAL COOKIE (Supabase)"
-            except:
-                source = "ENV VAR (KICK_COOKIE)"
-        elif INITIAL_COOKIE and _urlparse.unquote(INITIAL_COOKIE) == cookie:
-            source = "🌐 ENV VAR (KICK_COOKIE)"
-        elif os.path.exists(COOKIE_FILE):
-            source = "📁 LOCAL FILE"
+                    source = "👤 YOUR COOKIE (/setcookie)"
+            except: pass
         
         # Count user cookies
         user_count = 0
@@ -2090,13 +2069,13 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             tg_send("Usage: /watchtest &lt;user1&gt; [user2] [user3]...\nExample: /watchtest stake casinoen", chat_id=chat_id)
             return
         usernames = [p.strip("@") for p in parts[1:] if p.strip("@")]
-        success, msg = single_watcher.start(chat_id, usernames)
+        success, msg = get_single_watcher(chat_id).start(chat_id, usernames)
         tg_send(msg, chat_id=chat_id)
 
     elif cmd == "/watchstop":
         # Stop both SingleWatcher and SlotsWatcher
         msgs = []
-        s, m = single_watcher.stop(reason="user stopped")
+        s, m = get_single_watcher(chat_id).stop(reason="user stopped")
         if s: msgs.append(m)
         s, m = slots_watcher.stop()
         if s: msgs.append(m)
@@ -2113,7 +2092,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         tg_send(msg, chat_id=chat_id)
 
     elif cmd == "/watchstatus":
-        msg = single_watcher.get_status() + "\n\n" + slots_watcher.get_status()
+        msg = get_single_watcher(chat_id).get_status() + "\n\n" + slots_watcher.get_status()
         tg_send(msg, chat_id=chat_id)
 
     elif cmd == "/startwatching":
@@ -2269,7 +2248,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         # Watcher stats
         sw_watching = len(slots_watcher.watching) if slots_watcher.active else 0
         pw_watching = len(pw.watchers) if pw.active else 0
-        single_watching = len(single_watcher.watchers) if single_watcher.active else 0
+        single_watching = sum(len(sw.watchers) for sw in single_watchers.values())
         total_watching = sw_watching + pw_watching + single_watching
         
         # Drop stats
@@ -2293,7 +2272,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
                 f"<b>Watchers:</b>\n"
                 f"  Slots &amp; Casino: {sw_watching} {'ACTIVE' if slots_watcher.active else 'IDLE'}\n"
                 f"  Parallel: {pw_watching} {'ACTIVE' if pw.active else 'IDLE'}\n"
-                f"  Single: {single_watching} {'ACTIVE' if single_watcher.active else 'IDLE'}\n"
+                f"  Single: {single_watching} {'ACTIVE' if any(sw.active for sw in single_watchers.values()) else 'IDLE'}\n"
                 f"  Total watching: {total_watching}\n\n"
                 f"<b>Drops:</b>\n"
                 f"  Known channels: {known_channels}\n"
