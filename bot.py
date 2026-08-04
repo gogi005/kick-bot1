@@ -17,6 +17,15 @@ import websockets
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# TLS fingerprint spoofing - defeats Cloudflare JA3/JA4 detection
+try:
+    import tls_client
+    HAS_TLS_CLIENT = True
+    print("[INIT] tls_client available - using Chrome 120 TLS fingerprint")
+except ImportError:
+    HAS_TLS_CLIENT = False
+    print("[INIT] tls_client NOT available - using urllib (bot detection likely)")
+
 # Supabase database module (persistent storage)
 try:
     import supabase_db as db
@@ -75,6 +84,72 @@ BASE_HEADERS = {
     "Referer": "https://kick.com/",
     "x-app-platform": "web",
 }
+
+# Cloudflare-compliant headers (mimics real Chrome browser)
+BROWSER_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
+def get_tls_session():
+    """Get a tls_client session with Chrome 120 TLS fingerprint.
+    This defeats Cloudflare JA3/JA4 TLS fingerprinting detection."""
+    if not HAS_TLS_CLIENT:
+        return None
+    try:
+        s = tls_client.Session(
+            client_identifier="chrome_120",
+            random_tls_extension_order=True
+        )
+        s.headers.update(BROWSER_HEADERS)
+        return s
+    except Exception as e:
+        print(f"[TLS] Session error: {e}")
+        return None
+
+def tls_get(url, headers=None, timeout=10):
+    """HTTP GET using tls_client (Chrome TLS fingerprint).
+    Falls back to urllib if tls_client unavailable."""
+    s = get_tls_session()
+    if s:
+        if headers:
+            s.headers.update(headers)
+        try:
+            resp = s.get(url, timeout_seconds=timeout)
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code in (403, 429):
+                print(f"[TLS] {url} -> HTTP {resp.status_code} (Cloudflare/rate limit)")
+                return None
+            else:
+                print(f"[TLS] {url} -> HTTP {resp.status_code}")
+                return None
+        except Exception as e:
+            print(f"[TLS] {url} error: {e}")
+            return None
+    else:
+        # Fallback to urllib
+        try:
+            req = urllib.request.Request(url)
+            for k, v in BASE_HEADERS.items():
+                req.add_header(k, v)
+            if headers:
+                for k, v in headers.items():
+                    req.add_header(k, v)
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            return json.loads(resp.read().decode())
+        except:
+            return None
 # ================================
 
 LOG_BUFFER = []
@@ -175,7 +250,7 @@ def save_cookie(cookie):
 
 # ---- Session Keeper (HTTP-based, no browser needed) ----
 def session_keeper():
-    """Keep session alive via HTTP check."""
+    """Keep session alive via HTTP check using tls_client."""
     global COOKIE_VALIDATED
     log("Session keeper started")
     while True:
@@ -187,21 +262,43 @@ def session_keeper():
                 time.sleep(KEEPER_INTERVAL)
                 continue
             
-            headers = dict(BASE_HEADERS)
-            headers["Cookie"] = "session=" + cookie
-            headers["Authorization"] = f"Bearer {cookie}"
-            headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-            req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
-            resp = urllib.request.urlopen(req, timeout=15)
-            data = json.loads(resp.read().decode())
-            
-            if data.get("username"):
-                log(f"[KEEPER] Session alive - @{data['username']}")
-                COOKIE_VALIDATED = True
+            # Use tls_client for Chrome TLS fingerprint
+            s = get_tls_session()
+            if s:
+                s.headers["Cookie"] = f"session={cookie}"
+                s.headers["Authorization"] = f"Bearer {cookie}"
+                s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+                resp = s.get("https://kick.com/api/v2/users/me", timeout_seconds=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("username"):
+                        log(f"[KEEPER] Session alive - @{data['username']}")
+                        COOKIE_VALIDATED = True
+                    else:
+                        log("[KEEPER] Cookie valid but no user data")
+                        COOKIE_VALIDATED = True
+                elif resp.status_code == 401:
+                    log("[KEEPER] Cookie EXPIRED! Use /setcookie to update.")
+                    COOKIE_VALIDATED = False
+                    tg_send_admin("<b>🔴 Cookie EXPIRED!</b>\nBot cannot claim drops.\nSend /setcookie with new cookie.")
+                else:
+                    log(f"[KEEPER] HTTP {resp.status_code}")
             else:
-                log("[KEEPER] Cookie valid but no user data")
-                COOKIE_VALIDATED = True
-            
+                # Fallback to urllib
+                headers = dict(BASE_HEADERS)
+                headers["Cookie"] = "session=" + cookie
+                headers["Authorization"] = f"Bearer {cookie}"
+                headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+                req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
+                resp = urllib.request.urlopen(req, timeout=15)
+                data = json.loads(resp.read().decode())
+                if data.get("username"):
+                    log(f"[KEEPER] Session alive - @{data['username']}")
+                    COOKIE_VALIDATED = True
+                else:
+                    log("[KEEPER] Cookie valid but no user data")
+                    COOKIE_VALIDATED = True
+                
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 log("[KEEPER] Cookie EXPIRED! Use /setcookie to update.")
@@ -310,6 +407,27 @@ def kick_request(url, extra_headers=None, timeout=15, user_id=None):
         raise
 
 def fetch_campaigns(user_id=None):
+    """Fetch campaigns using tls_client to bypass Cloudflare."""
+    s = get_tls_session()
+    if s:
+        try:
+            cookie = get_cookie(user_id)
+            if cookie:
+                s.headers["Cookie"] = f"session={cookie}"
+                s.headers["Authorization"] = f"Bearer {cookie}"
+            s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+            resp = s.get(DROPS_API, timeout_seconds=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("data", []), True
+            elif resp.status_code in (401, 403):
+                return None, False
+            else:
+                return None, True
+        except Exception as e:
+            print(f"[CAMPAIGNS] tls_client error: {e}")
+    
+    # Fallback to urllib
     try:
         data = kick_request(DROPS_API, user_id=user_id)
         return data.get("data", []), True
@@ -319,6 +437,24 @@ def fetch_campaigns(user_id=None):
     except: return None, True
 
 def get_channel_info(username):
+    """Get channel info using tls_client to bypass Cloudflare detection."""
+    s = get_tls_session()
+    if s:
+        try:
+            resp = s.get(f"https://kick.com/api/v2/channels/{username}", timeout_seconds=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                livestream = data.get("livestream") or {}
+                return {
+                    "channel_id": data.get("id"),
+                    "livestream_id": livestream.get("id"),
+                    "username": data.get("slug", username),
+                    "is_live": bool(livestream.get("is_live")),
+                }
+        except Exception as e:
+            print(f"[CHANNEL] tls_client error @{username}: {e}")
+    
+    # Fallback to urllib
     try:
         data = kick_request(CHANNEL_API.format(username=username))
         livestream = data.get("livestream") or {}
@@ -436,6 +572,31 @@ def try_claim_in_chat(username):
     return None
 
 def get_ws_token(session_token):
+    """Get WebSocket viewer token using tls_client for Chrome TLS fingerprint.
+    This defeats Cloudflare JA3/JA4 detection on the token endpoint."""
+    s = get_tls_session()
+    if s:
+        try:
+            # First visit kick.com to establish Cloudflare clearance cookies
+            s.get("https://kick.com/", timeout_seconds=10)
+            
+            token_headers = {
+                "Accept": "application/json, text/plain, */*",
+                "X-Client-Token": KICK_CLIENT_TOKEN,
+                "Referer": "https://kick.com/",
+                "Origin": "https://kick.com",
+            }
+            resp = s.get("https://websockets.kick.com/viewer/v1/token", 
+                         headers=token_headers, timeout_seconds=10)
+            if resp.status_code == 200:
+                token = resp.json().get("data", {}).get("token")
+                if token:
+                    return token
+            print(f"[WS-TOKEN] tls_client HTTP {resp.status_code}")
+        except Exception as e:
+            print(f"[WS-TOKEN] tls_client error: {e}")
+    
+    # Fallback to urllib
     try:
         data = kick_request(WS_TOKEN_API, extra_headers={
             "Authorization": f"Bearer {session_token}",
@@ -450,7 +611,7 @@ def get_session_token(user_id=None):
     return get_cookie(user_id)  # Already decoded by get_cookie()
 
 def validate_cookie_and_get_user(cookie):
-    """Validate cookie by fetching user info from Kick.
+    """Validate cookie by fetching user info from Kick using tls_client.
     Returns (valid, username, user_id)
     
     Priority:
@@ -468,7 +629,28 @@ def validate_cookie_and_get_user(cookie):
         log("[COOKIE] Validation failed: cookie too short or empty")
         return False, None, None
     
-    # Method 1: Try users/me API (BEST - gives actual username)
+    # Method 1: Try users/me API using tls_client (BEST)
+    s = get_tls_session()
+    if s:
+        try:
+            s.headers["Cookie"] = f"session={decoded}"
+            s.headers["Authorization"] = f"Bearer {decoded}"
+            s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+            resp = s.get("https://kick.com/api/v2/users/me", timeout_seconds=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("username"):
+                    log(f"[COOKIE] Valid via users/me: @{data['username']} (ID: {data.get('id', '?')})")
+                    return True, data["username"], data.get("id", 0)
+                elif data.get("id"):
+                    log(f"[COOKIE] Valid via users/me: ID={data['id']} (no username)")
+                    return True, f"user_{data['id']}", data["id"]
+            else:
+                log(f"[COOKIE] Method 1 (users/me) failed: HTTP {resp.status_code}")
+        except Exception as e:
+            log(f"[COOKIE] Method 1 tls_client error: {e}")
+    
+    # Method 1 fallback: urllib
     try:
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + decoded
@@ -484,7 +666,7 @@ def validate_cookie_and_get_user(cookie):
         if data.get("username"):
             log(f"[COOKIE] Valid via users/me: @{data['username']} (ID: {data.get('id', '?')})")
             return True, data["username"], data.get("id", 0)
-        elif data.get("id"):  # Has ID but no username
+        elif data.get("id"):
             log(f"[COOKIE] Valid via users/me: ID={data['id']} (no username)")
             return True, f"user_{data['id']}", data["id"]
     except urllib.error.HTTPError as e:
@@ -546,13 +728,35 @@ def validate_cookie_and_get_user(cookie):
 _progress_cache = {"data": None, "ts": 0, "fail_count": 0}
 
 def fetch_progress(user_id=None):
+    """Fetch drop progress using tls_client to bypass Cloudflare Kasada."""
     global _progress_cache
     now = time.time()
-    # Cache for 30 seconds to avoid 403 Kasada rate limits
-    # If recently failed, back off even more
     cache_ttl = 60 if _progress_cache.get("fail_count", 0) > 3 else 30
     if _progress_cache["data"] is not None and now - _progress_cache["ts"] < cache_ttl:
         return _progress_cache["data"]
+    
+    s = get_tls_session()
+    if s:
+        try:
+            cookie = get_cookie(user_id)
+            if cookie:
+                s.headers["Cookie"] = f"session={cookie}"
+                s.headers["Authorization"] = f"Bearer {cookie}"
+            s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+            resp = s.get(PROGRESS_API, timeout_seconds=10)
+            if resp.status_code == 200:
+                data = resp.json().get("data", [])
+                _progress_cache = {"data": data, "ts": now, "fail_count": 0}
+                return data
+            else:
+                _progress_cache["fail_count"] = _progress_cache.get("fail_count", 0) + 1
+                print(f"[PROGRESS] tls_client HTTP {resp.status_code}")
+                return _progress_cache["data"] or []
+        except Exception as e:
+            _progress_cache["fail_count"] = _progress_cache.get("fail_count", 0) + 1
+            print(f"[PROGRESS] tls_client error: {e}")
+    
+    # Fallback to urllib
     try:
         cookie = get_cookie(user_id)
         headers = dict(BASE_HEADERS)
@@ -567,14 +771,35 @@ def fetch_progress(user_id=None):
         return data
     except urllib.error.HTTPError as e:
         _progress_cache["fail_count"] = _progress_cache.get("fail_count", 0) + 1
-        log(f"[PROGRESS] HTTP {e.code} (fail #{_progress_cache['fail_count']}): {e.read().decode()[:200] if e.fp else ''}")
         return _progress_cache["data"] or []
     except Exception as e:
         _progress_cache["fail_count"] = _progress_cache.get("fail_count", 0) + 1
-        log(f"[PROGRESS] Error: {e}")
         return _progress_cache["data"] or []
 
 def claim_reward(campaign_id, reward_id, user_id=None):
+    """Claim reward using tls_client for Cloudflare bypass."""
+    s = get_tls_session()
+    if s:
+        try:
+            cookie = get_cookie(user_id)
+            if cookie:
+                s.headers["Cookie"] = f"session={cookie}"
+                s.headers["Authorization"] = f"Bearer {cookie}"
+            s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+            s.headers["Content-Type"] = "application/json"
+            body = json.dumps({"campaign_id": campaign_id, "reward_id": reward_id})
+            resp = s.post(CLAIM_API, data=body, timeout_seconds=10)
+            if resp.status_code == 200:
+                result = resp.json()
+                log(f"[CLAIM] OK: {result}")
+                return result
+            else:
+                log(f"[CLAIM] HTTP {resp.status_code}: {resp.text[:200]}")
+                return None
+        except Exception as e:
+            log(f"[CLAIM] tls_client error: {e}")
+    
+    # Fallback to urllib
     try:
         cookie = get_cookie(user_id)
         headers = dict(BASE_HEADERS)
@@ -1125,6 +1350,7 @@ class SingleStreamWatcher:
         if not ws_token: raise Exception("No WS token")
         ws_url = WS_URL_TEMPLATE.format(token=ws_token)
         headers = dict(BASE_HEADERS)
+        headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try: loop.run_until_complete(self._ws_loop(ws_url, headers))
@@ -1146,6 +1372,7 @@ class SingleStreamWatcher:
             last_alive = time.time()
             last_refresh = time.time()
             watch_start = time.time()
+            ue_interval = random.randint(45, 65)  # Jitter: 45-65s instead of exactly 60s
             while not self.stop_event.is_set():
                 now = time.time()
                 elapsed_since_start = now - watch_start
@@ -1156,12 +1383,13 @@ class SingleStreamWatcher:
                         try: await asyncio.wait_for(ws.recv(), timeout=3)
                         except: pass
                     except: pass
-                if now - last_ue >= 60:
+                if now - last_ue >= ue_interval:
                     await send_user_event(ws, channel_id, livestream_id)
                     with self._lock:
                         self.events_sent += 1
                         self.watch_time += 60
                     last_ue = now
+                    ue_interval = random.randint(45, 65)  # Re-randomize for next interval
                     if elapsed_since_start >= 60:
                         smart_claim_check(username, user_id=self.user_id)
                     log(f"[WATCH] event #{self.events_sent} @{username} ({fmt_duration(self.watch_time)})")
@@ -1374,6 +1602,7 @@ class StreamWatcher:
             if not ws_token: return
             ws_url = WS_URL_TEMPLATE.format(token=ws_token)
             headers = dict(BASE_HEADERS)
+            headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try: loop.run_until_complete(self._watch(ws_url, headers))
@@ -1398,6 +1627,7 @@ class StreamWatcher:
             last_ping = time.time()
             last_refresh = time.time()
             ev_count = 1
+            ue_interval = random.randint(45, 65)  # Jitter
             while not self.stop_event.is_set():
                 now = time.time()
                 elapsed = now - start
@@ -1411,10 +1641,11 @@ class StreamWatcher:
                         try: await asyncio.wait_for(ws.recv(), timeout=3)
                         except: pass
                     except: pass
-                if now - last_ue >= 60:
+                if now - last_ue >= ue_interval:
                     await send_user_event(ws, channel_id, livestream_id)
                     ev_count += 1
                     last_ue = now
+                    ue_interval = random.randint(45, 65)  # Re-randomize
                     remaining = int(self.target_seconds - elapsed)
                     log(f"[SW] event #{ev_count} @{username} ({remaining}s left)")
                 if now - last_refresh >= 300:
@@ -1577,6 +1808,7 @@ class SlotsWatcher:
             
             ws_url = WS_URL_TEMPLATE.format(token=ws_token)
             headers = dict(BASE_HEADERS)
+            headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
             
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -1609,6 +1841,7 @@ class SlotsWatcher:
             start = time.time()
             last_ue = time.time()
             last_ping = time.time()
+            ue_interval = random.randint(45, 65)  # Jitter
             
             while not stop_event.is_set():
                 now = time.time()
@@ -1627,10 +1860,11 @@ class SlotsWatcher:
                         except: pass
                     except: pass
                 
-                # User event every 60s + auto claim check
-                if now - last_ue >= 60:
+                # User event with jitter + auto claim check
+                if now - last_ue >= ue_interval:
                     await send_user_event(ws, channel_id, ls_id)
                     last_ue = now
+                    ue_interval = random.randint(45, 65)  # Re-randomize
                     remaining = int(target_seconds - elapsed)
                     log(f"[SW] @{username} event ({remaining}s left)")
                     # Auto-claim check after first minute of watching
@@ -2353,6 +2587,7 @@ def _test_watch_loop(slug, channel_id, livestream_id, stop_event, duration_secs)
             
             ws_url = WS_URL_TEMPLATE.format(token=ws_token)
             headers = dict(BASE_HEADERS)
+            headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
             
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -2385,6 +2620,7 @@ async def _test_ws_loop(ws_url, headers, slug, channel_id, livestream_id, stop_e
         last_ue = time.time()
         last_ping = time.time()
         events_sent = 1
+        ue_interval = random.randint(45, 65)  # Jitter
         
         while not stop_event.is_set():
             now = time.time()
@@ -2402,10 +2638,11 @@ async def _test_ws_loop(ws_url, headers, slug, channel_id, livestream_id, stop_e
                     except: pass
                 except: pass
             
-            if now - last_ue >= 60:
+            if now - last_ue >= ue_interval:
                 await send_user_event(ws, channel_id, ls_id)
                 events_sent += 1
                 last_ue = now
+                ue_interval = random.randint(45, 65)  # Re-randomize
                 remaining = int(duration_secs - elapsed)
                 log(f"[TEST] @{slug} event #{events_sent} ({remaining//60}m left)")
             
@@ -2730,6 +2967,7 @@ class DropHunter:
                 
                 ws_url = WS_URL_TEMPLATE.format(token=ws_token)
                 headers = dict(BASE_HEADERS)
+                headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
@@ -2761,6 +2999,7 @@ class DropHunter:
             last_ue = time.time()
             last_ping = time.time()
             last_refresh = time.time()
+            ue_interval = random.randint(45, 65)  # Jitter
             
             while not stop_event.is_set():
                 now = time.time()
@@ -2774,7 +3013,7 @@ class DropHunter:
                         except Exception as e: log(f"[DH] Ping recv error @{slug}: {e}")
                     except Exception as e: log(f"[DH] Ping send error @{slug}: {e}")
                 
-                if now - last_ue >= 60:
+                if now - last_ue >= ue_interval:
                     # Refresh livestream_id
                     if now - last_refresh >= 300:
                         last_refresh = now
@@ -2786,6 +3025,7 @@ class DropHunter:
                     
                     await send_user_event(ws, channel_id, ls_id)
                     last_ue = now
+                    ue_interval = random.randint(45, 65)  # Re-randomize
                     
                     with self._lock:
                         if slug in self.watching_channels:
@@ -3070,8 +3310,9 @@ def poller():
 def main():
     global COOKIE_VALIDATED
     log("=" * 50)
-    log("KICK STAKE DROPS BOT v25 - TIME WINDOW + TEST MODE")
+    log("KICK STAKE DROPS BOT v26 - TLS FINGERPRINT FIX")
     log("=" * 50)
+    log(f"tls_client: {'Chrome 120 fingerprint ACTIVE' if HAS_TLS_CLIENT else 'DISABLED (bot detection likely!)'}")
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
     log(f"Dashboard: port {DASHBOARD_PORT} (user: {DASH_USER})")
     
@@ -3085,33 +3326,60 @@ def main():
             except: pass
     threading.Thread(target=_self_ping, daemon=True).start()
     
-    # Validate cookie on startup
+    # Validate cookie on startup using tls_client
     cookie = get_cookie()
     if cookie:
-        try:
-            headers = dict(BASE_HEADERS)
-            headers["Cookie"] = "session=" + cookie
-            headers["Authorization"] = f"Bearer {cookie}"
-            headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-            req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
-            resp = urllib.request.urlopen(req, timeout=10)
-            data = json.loads(resp.read().decode())
-            if data.get("username"):
+        # Try tls_client first
+        s = get_tls_session()
+        if s:
+            try:
+                s.headers["Cookie"] = f"session={cookie}"
+                s.headers["Authorization"] = f"Bearer {cookie}"
+                s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+                resp = s.get("https://kick.com/api/v2/users/me", timeout_seconds=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("username"):
+                        COOKIE_VALIDATED = True
+                        log(f"[STARTUP] Cookie VALID - @{data['username']}")
+                    else:
+                        COOKIE_VALIDATED = True
+                        log("[STARTUP] Cookie check - no username but no error")
+                elif resp.status_code == 401:
+                    COOKIE_VALIDATED = False
+                    log("[STARTUP] Cookie EXPIRED! Use /setcookie to update.")
+                else:
+                    COOKIE_VALIDATED = True
+                    log(f"[STARTUP] Cookie check: HTTP {resp.status_code} (not cookie issue)")
+            except Exception as e:
                 COOKIE_VALIDATED = True
-                log(f"[STARTUP] Cookie VALID - @{data['username']}")
-            else:
+                log(f"[STARTUP] Cookie check error: {str(e)[:50]} (assuming valid)")
+        else:
+            # Fallback to urllib
+            try:
+                headers = dict(BASE_HEADERS)
+                headers["Cookie"] = "session=" + cookie
+                headers["Authorization"] = f"Bearer {cookie}"
+                headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+                req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
+                resp = urllib.request.urlopen(req, timeout=10)
+                data = json.loads(resp.read().decode())
+                if data.get("username"):
+                    COOKIE_VALIDATED = True
+                    log(f"[STARTUP] Cookie VALID - @{data['username']}")
+                else:
+                    COOKIE_VALIDATED = True
+                    log("[STARTUP] Cookie check - no username but no error")
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    COOKIE_VALIDATED = False
+                    log("[STARTUP] Cookie EXPIRED! Use /setcookie to update.")
+                else:
+                    COOKIE_VALIDATED = True
+                    log(f"[STARTUP] Cookie check: HTTP {e.code} (not cookie issue)")
+            except Exception as e:
                 COOKIE_VALIDATED = True
-                log("[STARTUP] Cookie check - no username but no error")
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                COOKIE_VALIDATED = False
-                log("[STARTUP] Cookie EXPIRED! Use /setcookie to update.")
-            else:
-                COOKIE_VALIDATED = True
-                log(f"[STARTUP] Cookie check: HTTP {e.code} (not cookie issue)")
-        except Exception as e:
-            COOKIE_VALIDATED = True
-            log(f"[STARTUP] Cookie check error: {str(e)[:50]} (assuming valid)")
+                log(f"[STARTUP] Cookie check error: {str(e)[:50]} (assuming valid)")
     else:
         COOKIE_VALIDATED = False
         log("[STARTUP] No cookie found! Use /setcookie to add one.")
@@ -3128,7 +3396,8 @@ def main():
     except: pass
     
     status = "✅ Cookie OK" if COOKIE_VALIDATED else "🔴 Cookie INVALID"
-    tg_send_admin(f"<b>Bot v24 Started!</b>\n\nCookie: {status}\nDrop Hunter: active\nActive Hours: 4 AM - 10 AM IST\nManual: /watchtest works 24/7")
+    tls_status = "✅ Chrome 120" if HAS_TLS_CLIENT else "❌ urllib (detection risk)"
+    tg_send_admin(f"<b>Bot v26 Started!</b>\n\nCookie: {status}\nTLS: {tls_status}\nDrop Hunter: active\nActive Hours: 2 AM - 11 AM IST\nManual: /watchtest works 24/7")
     log("Listening...")
     offset = 0
     while True:
