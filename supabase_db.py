@@ -437,6 +437,20 @@ def remove_user_cookie(user_id):
         print(f"[DB] remove_user_cookie error: {e}")
         return False
 
+def remove_all_user_cookies():
+    """Remove ALL user cookies - admin command to reset everyone to global cookie"""
+    def _do():
+        client = get_client()
+        # Delete all rows from user_cookies table
+        result = client.table("user_cookies").delete().neq("user_id", 0).execute()
+        print(f"[DB] Removed all user cookies")
+        return True
+    try:
+        return _retry(_do)
+    except Exception as e:
+        print(f"[DB] remove_all_user_cookies error: {e}")
+        return False
+
 # ==================== USER PREFERENCES (Custom Streamers) ====================
 def add_user_preference(user_id, channel_name):
     """Add a custom streamer to user's preference list"""

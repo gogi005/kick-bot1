@@ -461,13 +461,13 @@ def get_session_token(user_id=None):
     return get_cookie(user_id)  # Already decoded by get_cookie()
 
 def validate_cookie_and_get_user(cookie):
-    """Validate cookie by fetching followed channels from Kick.
-    Returns (valid, username_or_count, user_id_or_channels)
+    """Validate cookie by fetching user info from Kick.
+    Returns (valid, username, user_id)
     
-    Note: kick.com/api/v2 endpoints are Kasada-protected and may fail.
-    We try multiple validation methods:
-    1. kick.com/api/v2/channels/followed (primary - returns followed channels)
-    2. kick.com/api/v2/users/me (fallback - returns user info)
+    Priority:
+    1. kick.com/api/v2/users/me (BEST - returns actual username + user ID)
+    2. kick.com/api/v2/channels/followed (fallback - only validates, no username)
+    3. kick.com/api/v1/drops/campaigns (fallback - only validates)
     """
     # Ensure cookie is decoded (| not %7C)
     try:
@@ -479,7 +479,32 @@ def validate_cookie_and_get_user(cookie):
         log("[COOKIE] Validation failed: cookie too short or empty")
         return False, None, None
     
-    # Method 1: Try followed channels API
+    # Method 1: Try users/me API (BEST - gives actual username)
+    try:
+        headers = dict(BASE_HEADERS)
+        headers["Cookie"] = "session=" + decoded
+        headers["Authorization"] = "Bearer " + decoded
+        headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+        
+        req = urllib.request.Request("https://kick.com/api/v2/users/me")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode())
+        
+        if data.get("username"):
+            log(f"[COOKIE] Valid via users/me: @{data['username']} (ID: {data.get('id', '?')})")
+            return True, data["username"], data.get("id", 0)
+        elif data.get("id"):  # Has ID but no username
+            log(f"[COOKIE] Valid via users/me: ID={data['id']} (no username)")
+            return True, f"user_{data['id']}", data["id"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:200] if e.fp else ""
+        log(f"[COOKIE] Method 1 (users/me) failed: HTTP {e.code}: {body}")
+    except Exception as e:
+        log(f"[COOKIE] Method 1 error: {e}")
+    
+    # Method 2: Try followed channels API (validates but no username)
     try:
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + decoded
@@ -496,32 +521,10 @@ def validate_cookie_and_get_user(cookie):
         if channels is not None:  # Valid response
             channel_names = [ch.get("channel_slug", "?") for ch in channels[:3]]
             log(f"[COOKIE] Valid! {len(channels)} followed channels: {', '.join(channel_names)}")
-            return True, f"{len(channels)} channels", len(channels)
+            return True, None, None  # Valid but no username
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:200] if e.fp else ""
-        log(f"[COOKIE] Method 1 (followed) failed: HTTP {e.code}: {body}")
-    except Exception as e:
-        log(f"[COOKIE] Method 1 error: {e}")
-    
-    # Method 2: Try users/me API
-    try:
-        headers = dict(BASE_HEADERS)
-        headers["Cookie"] = "session=" + decoded
-        headers["Authorization"] = "Bearer " + decoded
-        headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-        
-        req = urllib.request.Request("https://kick.com/api/v2/users/me")
-        for k, v in headers.items():
-            req.add_header(k, v)
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(resp.read().decode())
-        
-        if data.get("username"):
-            log(f"[COOKIE] Valid via users/me: @{data['username']}")
-            return True, data["username"], data.get("id", 0)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:200] if e.fp else ""
-        log(f"[COOKIE] Method 2 (users/me) failed: HTTP {e.code}: {body}")
+        log(f"[COOKIE] Method 2 (followed) failed: HTTP {e.code}: {body}")
     except Exception as e:
         log(f"[COOKIE] Method 2 error: {e}")
     
@@ -541,7 +544,7 @@ def validate_cookie_and_get_user(cookie):
         
         if campaigns is not None:  # Valid response (even if empty)
             log(f"[COOKIE] Cookie accepted by drops endpoint! {len(campaigns)} campaigns available")
-            return True, f"{len(campaigns)} campaigns", 0
+            return True, None, None  # Valid but no username
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:200] if e.fp else ""
         log(f"[COOKIE] Method 3 (drops) failed: HTTP {e.code}: {body}")
@@ -565,7 +568,7 @@ def fetch_progress(user_id=None):
         cookie = get_cookie(user_id)
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + cookie
-        headers["Authorization"] = f"Bearer {get_session_token()}"
+        headers["Authorization"] = f"Bearer {get_session_token(user_id)}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
         req = urllib.request.Request(PROGRESS_API)
         for k, v in headers.items(): req.add_header(k, v)
@@ -1806,9 +1809,10 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             "/watchnow - Admin: watch Slots &amp; Casino 24/7\n"
             "/startwatching - Test: watch all known live (1 hour)\n\n"
             "<b>CONFIG:</b>\n"
-            "/setcookie - Update cookie\n"
+            "/setcookie - Set your personal cookie\n"
             "/checkcookie - Check if cookie is valid\n"
-            "/mycookie - Admin: see current cookie\n"
+            "/mycookie - Admin: see admin cookie\n"
+            "/removecookie - Admin: remove all user cookies\n"
             "/stop - Unsubscribe\n"
             "/help - This",
             chat_id=chat_id)
@@ -1914,42 +1918,41 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         valid, username, user_id = validate_cookie_and_get_user(cookie)
         
         if valid:
-            # Save per-user cookie
+            # Save ONLY as per-user cookie (NEVER overwrite global admin cookie)
             if USE_SUPABASE:
                 db.save_user_cookie(chat_id, cookie, username or "unknown", user_id or 0)
-            
-            # Also save as global fallback
-            save_cookie(cookie)
+            else:
+                # Fallback: save to local file only
+                save_cookie(cookie)
             
             msg = (f"<b>Cookie Saved!</b>\n\n"
                    f"<b>Status:</b> VALID\n"
-                   f"<b>Followed:</b> {username}\n"
+                   f"<b>Kick User:</b> @{username}\n"
                    f"<b>Your TG ID:</b> {chat_id}\n\n"
-                   f"This cookie will be used for your account.\n"
-                   f"Bot will automatically claim drops.")
+                   f"This cookie is linked to YOUR account only.\n"
+                   f"Bot will use it for claiming drops on your behalf.")
             tg_send(msg, chat_id=chat_id)
             tg_send_admin(f"<b>NEW COOKIE SET!</b>\nFollowed: {username}\nTG: {chat_id}")
         else:
-            # Invalid cookie - save as global fallback
-            save_cookie(cookie)
-            tg_send("Cookie saved (validation failed - using as global fallback).\nIf this cookie is valid, it will work later.", chat_id=chat_id)
+            # Invalid cookie - do NOT save anywhere
+            tg_send("Cookie is INVALID or EXPIRED!\nPlease check your cookie and try again with /setcookie.", chat_id=chat_id)
 
     elif cmd == "/checkcookie":
-        global COOKIE_VALIDATED
-        cookie = get_cookie()
+        cookie = get_cookie(chat_id)
         if not cookie:
             tg_send("<b>🔴 No cookie found!</b>\nUse /setcookie to add one.", chat_id=chat_id)
             return
         valid, username, user_id = validate_cookie_and_get_user(cookie)
+        source = "YOUR OWN"
+        if chat_id == ADMIN_ID:
+            source = "ADMIN"
         if valid:
-            COOKIE_VALIDATED = True
-            tg_send(f"<b>✅ Cookie VALID!</b>\n\n<b>Kick User:</b> @{username}\n<b>User ID:</b> {user_id}\n<b>Cookie length:</b> {len(cookie)} chars", chat_id=chat_id)
+            tg_send(f"<b>✅ Cookie VALID!</b>\n\n<b>Kick User:</b> @{username}\n<b>User ID:</b> {user_id}\n<b>Source:</b> {source}\n<b>Cookie length:</b> {len(cookie)} chars", chat_id=chat_id)
         else:
-            COOKIE_VALIDATED = False
             tg_send(f"<b>🔴 Cookie INVALID/EXPIRED!</b>\n\nUse /setcookie with a fresh cookie.\n\n<i>How to get cookie:</i>\n1. Open kick.com in browser\n2. Login to your account\n3. Press F12 → Application → Cookies\n4. Copy the 'session' cookie value", chat_id=chat_id)
 
     elif cmd == "/mycookie":
-        # Admin-only: show which cookie is being used
+        # Admin-only: show current cookie info
         if chat_id != ADMIN_ID:
             tg_send("⛔ Admin only command.", chat_id=chat_id)
             return
@@ -1973,11 +1976,19 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
                     if global_cookie:
                         source = "🌍 GLOBAL COOKIE (Supabase)"
                     else:
-                        source = " ENV VAR (KICK_COOKIE)"
+                        source = "🌐 ENV VAR (KICK_COOKIE)"
             except:
                 source = "ENV VAR (KICK_COOKIE)"
         elif os.path.exists(COOKIE_FILE):
             source = "📁 LOCAL FILE"
+        
+        # Count user cookies
+        user_count = 0
+        if USE_SUPABASE:
+            try:
+                all_uc = db.get_all_user_cookies()
+                user_count = len(all_uc) if all_uc else 0
+            except: pass
         
         # Validate
         valid, username, user_id = validate_cookie_and_get_user(cookie)
@@ -1993,8 +2004,27 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
                f"<b>Kick User:</b> {kick_user}\n"
                f"<b>Length:</b> {len(cookie)} chars\n"
                f"<b>Preview:</b> <code>{masked}</code>\n\n"
-               f"<i>Cookie priority: User > ENV > Supabase > File</i>")
+               f"<b>Users with own cookie:</b> {user_count}\n"
+               f"<i>Everyone without personal cookie uses this</i>")
         tg_send(msg, chat_id=chat_id)
+
+    elif cmd == "/removecookie":
+        # Admin-only: remove ALL user cookies (everyone falls back to admin cookie)
+        if chat_id != ADMIN_ID:
+            tg_send("⛔ Admin only command.", chat_id=chat_id)
+            return
+        if not USE_SUPABASE:
+            tg_send("Supabase not available. Cannot remove user cookies.", chat_id=chat_id)
+            return
+        try:
+            all_uc = db.get_all_user_cookies()
+            count = len(all_uc) if all_uc else 0
+            db.remove_all_user_cookies()
+            log(f"[ADMIN] Removed all {count} user cookies")
+            tg_send(f"<b>✅ ALL USER COOKIES REMOVED!</b>\n\nRemoved: {count} users\n\nAll users will now use the admin/global cookie.", chat_id=chat_id)
+        except Exception as e:
+            log(f"[ADMIN] removecookie error: {e}")
+            tg_send(f"Error removing cookies: {e}", chat_id=chat_id)
 
     elif cmd == "/addchannel":
         parts = text.split()
