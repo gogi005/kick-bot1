@@ -85,7 +85,12 @@ _LOG_SAVE_TIMER = 0  # Debounce: only save logs every 30 seconds
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        # Windows cp1252 can't print emojis - encode safely
+        safe = line.encode('ascii', errors='replace').decode('ascii')
+        print(safe, flush=True)
     with LOG_LOCK:
         LOG_BUFFER.append({"time": datetime.now().isoformat(), "msg": msg})
         if len(LOG_BUFFER) > MAX_LOG_BUFFER:
@@ -547,14 +552,15 @@ def validate_cookie_and_get_user(cookie):
     log("[COOKIE] All validation methods failed - cookie may be expired or invalid")
     return False, None, None
 
-_progress_cache = {"data": None, "ts": 0}
+_progress_cache = {"data": None, "ts": 0, "fail_count": 0}
 
 def fetch_progress(user_id=None):
     global _progress_cache
     now = time.time()
-    # Cache for 5 seconds to avoid 403 rate limits
-    cache_key = f"user_{user_id}" if user_id else "global"
-    if _progress_cache["data"] is not None and now - _progress_cache["ts"] < 5:
+    # Cache for 30 seconds to avoid 403 Kasada rate limits
+    # If recently failed, back off even more
+    cache_ttl = 60 if _progress_cache.get("fail_count", 0) > 3 else 30
+    if _progress_cache["data"] is not None and now - _progress_cache["ts"] < cache_ttl:
         return _progress_cache["data"]
     try:
         cookie = get_cookie(user_id)
@@ -566,12 +572,14 @@ def fetch_progress(user_id=None):
         for k, v in headers.items(): req.add_header(k, v)
         resp = urllib.request.urlopen(req, timeout=15)
         data = json.loads(resp.read().decode()).get("data", [])
-        _progress_cache = {"data": data, "ts": now}
+        _progress_cache = {"data": data, "ts": now, "fail_count": 0}
         return data
     except urllib.error.HTTPError as e:
-        log(f"[PROGRESS] HTTP {e.code}: {e.read().decode()[:200] if e.fp else ''}")
+        _progress_cache["fail_count"] = _progress_cache.get("fail_count", 0) + 1
+        log(f"[PROGRESS] HTTP {e.code} (fail #{_progress_cache['fail_count']}): {e.read().decode()[:200] if e.fp else ''}")
         return _progress_cache["data"] or []
     except Exception as e:
+        _progress_cache["fail_count"] = _progress_cache.get("fail_count", 0) + 1
         log(f"[PROGRESS] Error: {e}")
         return _progress_cache["data"] or []
 
@@ -719,10 +727,13 @@ def smart_claim_check(username=None, user_id=None):
         return False
 
 async def send_user_event(ws, channel_id, livestream_id):
+    # Kick now returns UUIDs for livestream_id/channel_id
+    # Send as-is — Kick WS accepts both int and string UUID formats
+    ls_id = livestream_id or channel_id
     event = {"type": "user_event", "data": {"message": {
         "name": "tracking.user.watch.livestream",
         "channel_id": channel_id,
-        "livestream_id": int(livestream_id) if livestream_id else int(channel_id),
+        "livestream_id": ls_id,
     }}}
     await ws.send(json.dumps(event))
 
@@ -2173,12 +2184,16 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             tg_send("Usage: /broadcast &lt;message&gt;\n\nSends your message to all subscribed users.", chat_id=chat_id)
             return
         message = parts[1]
+        # HTML-escape the user's message to prevent parse errors
+        def _html_escape(s):
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe_message = _html_escape(message)
         subs = get_active_subs()
         if not subs:
             tg_send("No subscribers to broadcast to.", chat_id=chat_id)
             return
         # Add admin signature
-        broadcast_msg = f"<b>Message from Admin:</b>\n\n{message}\n\n<i>Sent to {len(subs)} users</i>"
+        broadcast_msg = f"<b>📢 Message from Admin:</b>\n\n{safe_message}\n\n<i>Sent to {len(subs)} users</i>"
         sent_count = 0
         failed_count = 0
         for uid in subs:
@@ -2188,9 +2203,13 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
                 req.add_header("Content-Type", "application/json")
                 urllib.request.urlopen(req, timeout=15)
                 sent_count += 1
-                time.sleep(0.05)  # Rate limit protection
-            except:
+                time.sleep(0.1)  # Rate limit protection - 100ms between sends
+            except urllib.error.HTTPError as e:
                 failed_count += 1
+                log(f"[BROADCAST] Failed for {uid}: HTTP {e.code}")
+            except Exception as e:
+                failed_count += 1
+                log(f"[BROADCAST] Failed for {uid}: {e}")
         log(f"[BROADCAST] Sent to {sent_count}/{len(subs)} users (failed: {failed_count})")
         tg_send(f"<b>Broadcast Complete!</b>\n\nSent: {sent_count}\nFailed: {failed_count}\nTotal: {len(subs)}", chat_id=chat_id)
 
