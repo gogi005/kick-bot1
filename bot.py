@@ -897,7 +897,8 @@ def get_slots_streamers():
                         "channel_id": channel_id,
                         "livestream_id": livestream_id,
                         "category": cat.get("name", "?"),
-                        "viewers": s.get("viewer_count", 0)
+                        "viewers": s.get("viewer_count", 0),
+                        "title": s.get("title", "") or ""
                     })
         
         # Update cache
@@ -2084,16 +2085,14 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
     elif cmd == "/live":
         tg_send("Checking...", chat_id=chat_id)
         try:
-            data = kick_request("https://web.kick.com/api/v1/livestreams?limit=100&sort=viewer_count", user_id=chat_id)
-            streams = data.get("data", [])
+            # Reuse proven get_slots_streamers() - correct URL + parsing
+            streams = get_slots_streamers()
             live_stake = []
             for s in streams:
-                user = s.get("broadcaster_user", {})
-                cat = s.get("category", {})
-                username = user.get("username", "")
+                username = s.get("username", "")
                 title = s.get("title", "")
-                viewers = s.get("viewer_count", 0)
-                cat_name = cat.get("name", "") if isinstance(cat, dict) else ""
+                viewers = s.get("viewers", 0)
+                cat_name = s.get("category", "")
                 combined = (username + title + cat_name).lower()
                 if any(k in combined for k in ["stake", "casino", "slots", "gamble"]):
                     live_stake.append({"username": username, "viewers": viewers, "title": title[:60], "category": cat_name})
