@@ -1920,6 +1920,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         if valid:
             # Save ONLY as per-user cookie (NEVER overwrite global admin cookie)
             if USE_SUPABASE:
+                print(f"[SETCOOKIE] Saving cookie for user {chat_id}: len={len(cookie)}, preview={cookie[:15]}...{cookie[-5:] if len(cookie) > 20 else cookie}")
                 db.save_user_cookie(chat_id, cookie, username or "unknown", user_id or 0)
             else:
                 # Fallback: save to local file only
@@ -1957,28 +1958,34 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             tg_send("⛔ Admin only command.", chat_id=chat_id)
             return
         
-        cookie = get_cookie()
+        # FIX: Use admin OWN cookie (pass chat_id) not global
+        cookie = get_cookie(chat_id)
         if not cookie:
             tg_send("<b>🔴 NO COOKIE SET!</b>\n\nUse /setcookie to add one.", chat_id=chat_id)
             return
         
-        # Determine source
+        # Determine source - match get_cookie() priority order
         source = "Unknown"
-        if INITIAL_COOKIE and get_cookie() == _urlparse.unquote(INITIAL_COOKIE):
-            source = "🌐 ENV VAR (KICK_COOKIE)"
-        elif USE_SUPABASE:
+        if USE_SUPABASE:
             try:
+                # 1. Check admin user cookie first (highest priority)
                 user_data = db.get_user_cookie(ADMIN_ID)
-                if user_data and user_data.get("cookie"):
+                if user_data and user_data.get("cookie") and _urlparse.unquote(user_data["cookie"]) == cookie:
                     source = "👤 ADMIN USER COOKIE (Supabase)"
                 else:
+                    # 2. Check global cookie
                     global_cookie = db.load_cookie_db()
-                    if global_cookie:
+                    if global_cookie and _urlparse.unquote(global_cookie) == cookie:
                         source = "🌍 GLOBAL COOKIE (Supabase)"
-                    else:
+                    # 3. Check env var
+                    elif INITIAL_COOKIE and _urlparse.unquote(INITIAL_COOKIE) == cookie:
                         source = "🌐 ENV VAR (KICK_COOKIE)"
+                    else:
+                        source = "🌍 GLOBAL COOKIE (Supabase)"
             except:
                 source = "ENV VAR (KICK_COOKIE)"
+        elif INITIAL_COOKIE and _urlparse.unquote(INITIAL_COOKIE) == cookie:
+            source = "🌐 ENV VAR (KICK_COOKIE)"
         elif os.path.exists(COOKIE_FILE):
             source = "📁 LOCAL FILE"
         

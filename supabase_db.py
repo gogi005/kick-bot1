@@ -382,7 +382,8 @@ def save_user_cookie(user_id, cookie, kick_username=None, kick_user_id=None):
         else:
             data["added_at"] = datetime.now().isoformat()
             client.table("user_cookies").insert(data).execute()
-        print(f"[DB] Saved cookie for user {user_id} (@{kick_username})")
+        print(f"[DB] Saved cookie for user {user_id} (@{kick_username}) - cookie length: {len(cookie)} chars")
+        print(f"[DB] Cookie preview: {cookie[:15]}...{cookie[-5:] if len(cookie) > 20 else cookie}")
         return True
     try:
         return _retry(_do)
@@ -401,8 +402,10 @@ def get_user_cookie(user_id):
             client.table("user_cookies").update({
                 "last_used": datetime.now().isoformat()
             }).eq("user_id", int(user_id)).execute()
+            cookie_val = row.get("cookie", "")
+            print(f"[DB] get_user_cookie({user_id}): cookie_len={len(cookie_val)}, preview={cookie_val[:15]}...{cookie_val[-5:] if len(cookie_val) > 20 else cookie_val}")
             return {
-                "cookie": row.get("cookie"),
+                "cookie": cookie_val,
                 "kick_username": row.get("kick_username"),
                 "kick_user_id": row.get("kick_user_id")
             }
