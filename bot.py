@@ -1627,12 +1627,18 @@ class SlotsWatcher:
                         except: pass
                     except: pass
                 
-                # User event every 60s
+                # User event every 60s + auto claim check
                 if now - last_ue >= 60:
                     await send_user_event(ws, channel_id, ls_id)
                     last_ue = now
                     remaining = int(target_seconds - elapsed)
                     log(f"[SW] @{username} event ({remaining}s left)")
+                    # Auto-claim check after first minute of watching
+                    if elapsed >= 60:
+                        try:
+                            smart_claim_check(username)
+                        except Exception as e:
+                            log(f"[SW] Claim check error @{username}: {e}")
                 
                 await asyncio.sleep(1)
     
@@ -2816,6 +2822,12 @@ class DropHunter:
     def _poll_and_watch(self):
         """Check campaigns, detect drops, send notifications, claim rewards.
         Always runs 24/7 for notifications. WS watching gated by active hours."""
+        # Increment polls counter
+        with self._lock:
+            self.state["polls"] = self.state.get("polls", 0) + 1
+            self.state["last_poll"] = datetime.now().isoformat()
+        self._save()
+        
         # Log watching status every minute
         self._log_watching_status()
         
