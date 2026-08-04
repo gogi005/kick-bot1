@@ -1793,14 +1793,10 @@ class SlotsWatcher:
         
         log("[SW] Slots Watcher stopped")
     
-    def _watch_one(self, username, channel_id, livestream_id, target_seconds, stop_event):
-        """Watch a single streamer for target_seconds."""
+    def _watch_one_sync(self, username, channel_id, livestream_id, target_seconds, stop_event):
+        """Watch a single streamer SYNCHRONOUSLY for target_seconds.
+        Blocks until watch time is complete. Only 1 WS connection at a time."""
         try:
-            # Wait for our turn (stagger starts)
-            self._wait(random.randint(1, 5))
-            if stop_event.is_set(): return
-            
-            # Connect via WebSocket
             ws_token = get_ws_token(get_cookie())
             if not ws_token:
                 log(f"[SW] No WS token for @{username}")
@@ -1816,13 +1812,8 @@ class SlotsWatcher:
                 loop.run_until_complete(self._ws_loop(ws_url, headers, username, channel_id, livestream_id, stop_event, target_seconds))
             finally:
                 loop.close()
-            
         except Exception as e:
             log(f"[SW] Error @{username}: {e}")
-        finally:
-            with self._lock:
-                self.watching.pop(username, None)
-            log(f"[SW] Done @{username}")
     
     async def _ws_loop(self, ws_url, headers, username, channel_id, livestream_id, stop_event, target_seconds):
         """WebSocket loop: send events every 60s until target reached."""
@@ -1836,7 +1827,7 @@ class SlotsWatcher:
             
             # Send first user event
             await send_user_event(ws, channel_id, ls_id)
-            log(f"[SW] Connected @{username}")
+            log(f"[SW] Connected @{username} channel_id={channel_id} livestream_id={ls_id}")
             
             start = time.time()
             last_ue = time.time()
@@ -1866,7 +1857,7 @@ class SlotsWatcher:
                     last_ue = now
                     ue_interval = random.randint(45, 65)  # Re-randomize
                     remaining = int(target_seconds - elapsed)
-                    log(f"[SW] @{username} event ({remaining}s left)")
+                    log(f"[SW] event @{username} {fmt_duration(elapsed)} elapsed ({remaining}s left)")
                     # Auto-claim check after first minute of watching
                     if elapsed >= 60:
                         try:
@@ -3310,7 +3301,7 @@ def poller():
 def main():
     global COOKIE_VALIDATED
     log("=" * 50)
-    log("KICK STAKE DROPS BOT v26 - TLS FINGERPRINT FIX")
+    log("KICK STAKE DROPS BOT v30 - SEQUENTIAL WATCH (1 at a time)")
     log("=" * 50)
     log(f"tls_client: {'Chrome 120 fingerprint ACTIVE' if HAS_TLS_CLIENT else 'DISABLED (bot detection likely!)'}")
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
