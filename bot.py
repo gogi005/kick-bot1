@@ -1,4 +1,5 @@
-"""Kick Stake Drops Bot v28 - SIMPLE WEBSOCKETS + AUTH FIX
+"""
+Kick Stake Drops Bot v25 - TIME WINDOW + TEST MODE
 - ACTIVE HOURS: 2 AM to 11 AM IST (auto watch)
 - POLLING: 24/7 every 5 seconds (always detects new drops)
 - MANUAL: /watchtest works 24/7
@@ -24,15 +25,6 @@ try:
 except ImportError:
     HAS_TLS_CLIENT = False
     print("[INIT] tls_client NOT available - using urllib (bot detection likely)")
-
-# curl_cffi for WebSocket Chrome TLS fingerprint (REQUIRED for watch time counting)
-try:
-    from curl_cffi.requests import AsyncSession as CurlAsyncSession
-    HAS_CURL_CFFI = True
-    print("[INIT] curl_cffi available - WebSocket will use Chrome 120 TLS")
-except ImportError:
-    HAS_CURL_CFFI = False
-    print("[INIT] curl_cffi NOT available - WebSocket may not count watch time!")
 
 # Supabase database module (persistent storage)
 try:
@@ -93,11 +85,20 @@ BASE_HEADERS = {
     "x-app-platform": "web",
 }
 
-# Basic browser headers for HTTP requests
+# Cloudflare-compliant headers (mimics real Chrome browser)
 BROWSER_HEADERS = {
-    "Accept": "application/json, text/plain, */*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
 
 def get_tls_session():
@@ -571,60 +572,39 @@ def try_claim_in_chat(username):
     return None
 
 def get_ws_token(session_token):
-    """Get WebSocket viewer token.
-    CRITICAL: Must ADD session cookie to cookie jar, NOT override headers!
-    Overwriting headers loses Cloudflare cf_clearance cookie."""
+    """Get WebSocket viewer token using tls_client for Chrome TLS fingerprint.
+    This defeats Cloudflare JA3/JA4 detection on the token endpoint."""
     s = get_tls_session()
     if s:
         try:
-            # Step 1: Visit kick.com to get Cloudflare clearance cookies
-            resp = s.get("https://kick.com/", timeout_seconds=10)
+            # First visit kick.com to establish Cloudflare clearance cookies
+            s.get("https://kick.com/", timeout_seconds=10)
             
-            # Step 2: ADD session cookie to cookie jar (NOT override headers!)
-            # This preserves cf_clearance from step 1
-            if session_token:
-                s.cookies.set("session", session_token, domain=".kick.com")
-                s.headers["Authorization"] = f"Bearer {session_token}"
-            s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-            s.headers["Accept"] = "application/json, text/plain, */*"
-            s.headers["Referer"] = "https://kick.com/"
-            s.headers["Origin"] = "https://kick.com"
-            
-            # Step 3: Get WS token (with all cookies including cf_clearance)
-            resp = s.get("https://websockets.kick.com/viewer/v1/token", timeout_seconds=10)
-            print(f"[WS-TOKEN] Response: {resp.status_code}")
+            token_headers = {
+                "Accept": "application/json, text/plain, */*",
+                "X-Client-Token": KICK_CLIENT_TOKEN,
+                "Referer": "https://kick.com/",
+                "Origin": "https://kick.com",
+            }
+            resp = s.get("https://websockets.kick.com/viewer/v1/token", 
+                         headers=token_headers, timeout_seconds=10)
             if resp.status_code == 200:
-                data = resp.json()
-                token = data.get("data", {}).get("token")
+                token = resp.json().get("data", {}).get("token")
                 if token:
-                    print(f"[WS-TOKEN] Got token ({len(token)} chars): {token[:30]}...")
                     return token
-                else:
-                    print(f"[WS-TOKEN] 200 but no token: {str(data)[:300]}")
-            else:
-                print(f"[WS-TOKEN] HTTP {resp.status_code}: {resp.text[:300]}")
+            print(f"[WS-TOKEN] tls_client HTTP {resp.status_code}")
         except Exception as e:
             print(f"[WS-TOKEN] tls_client error: {e}")
     
     # Fallback to urllib
     try:
-        headers = dict(BASE_HEADERS)
-        if session_token:
-            headers["Cookie"] = f"session={session_token}"
-            headers["Authorization"] = f"Bearer {session_token}"
-        headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-        req = urllib.request.Request(WS_TOKEN_API)
-        for k, v in headers.items():
-            req.add_header(k, v)
-        resp = urllib.request.urlopen(req, timeout=15)
-        data = json.loads(resp.read().decode())
-        token = data.get("data", {}).get("token")
-        if token:
-            print(f"[WS-TOKEN] Got token via urllib ({len(token)} chars)")
-        return token
-    except Exception as e:
-        print(f"[WS-TOKEN] urllib error: {e}")
-        return None
+        data = kick_request(WS_TOKEN_API, extra_headers={
+            "Authorization": f"Bearer {session_token}",
+            "X-Client-Token": KICK_CLIENT_TOKEN,
+            "Sec-Fetch-Site": "same-site",
+        })
+        return data.get("data", {}).get("token")
+    except: return None
 
 def get_session_token(user_id=None):
     """Return decoded cookie as Bearer token"""
@@ -962,84 +942,16 @@ def smart_claim_check(username=None, user_id=None):
         log(f"[CLAIM] Check error: {e}")
         return False
 
-async def send_user_event(ws, channel_id, livestream_id, session=None):
+async def send_user_event(ws, channel_id, livestream_id):
+    # Kick now returns UUIDs for livestream_id/channel_id
+    # Send as-is — Kick WS accepts both int and string UUID formats
     ls_id = livestream_id or channel_id
     event = {"type": "user_event", "data": {"message": {
         "name": "tracking.user.watch.livestream",
         "channel_id": channel_id,
-        "livestream_id": int(ls_id) if str(ls_id).isdigit() else ls_id,
+        "livestream_id": ls_id,
     }}}
-    await ws_send(ws, json.dumps(event), session)
-
-# ============================================================
-#  CURL_CFFI WEBSOCKET HELPER - Chrome TLS fingerprint
-# ============================================================
-async def ws_connect(ws_url, headers, user_id=None):
-    """Connect to WebSocket for Kick.com drop tracking.
-    Uses curl_cffi with Chrome 120 TLS fingerprint (REQUIRED for watch time).
-    Falls back to plain websockets if curl_cffi unavailable."""
-    cookie = get_cookie(user_id)
-    ws_headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Origin": "https://kick.com",
-        "Referer": "https://kick.com/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-    }
-    if cookie:
-        # CRITICAL: Kick.com session cookie is named 'session' NOT 'session_token'!
-        ws_headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}; session={cookie}"
-        ws_headers["Authorization"] = f"Bearer {cookie}"
-    else:
-        ws_headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
-    headers.update(ws_headers)
-    
-    # curl_cffi with Chrome 120 TLS fingerprint (REQUIRED for watch time counting)
-    if HAS_CURL_CFFI:
-        try:
-            session = CurlAsyncSession(impersonate="chrome120")
-            ws = await session.ws_connect(ws_url, headers=ws_headers)
-            print("[WS] Connected with Chrome 120 TLS fingerprint")
-            return ws, session
-        except Exception as e:
-            print(f"[WS] curl_cffi error: {e}")
-    
-    # Fallback to plain websockets (may not count watch time)
-    print("[WS] WARNING: Using plain websockets - watch time may not count!")
-    import websockets
-    ws = await websockets.connect(ws_url, additional_headers=ws_headers)
-    return ws, None
-
-async def ws_send(ws, data, session=None):
-    """Send message via WebSocket."""
-    await ws.send(data)
-
-async def ws_recv(ws, session=None, timeout=1.0):
-    """Receive message from WS with timeout."""
-    try:
-        msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
-        return msg
-    except:
-        return None
-
-# Keep old function names as aliases for backward compatibility
-curl_ws_connect = ws_connect
-curl_ws_send = ws_send
-curl_ws_recv = ws_recv
-
-# Keep old function names as aliases for backward compatibility
-curl_ws_connect = ws_connect
-curl_ws_send = ws_send
-curl_ws_recv = ws_recv
+    await ws.send(json.dumps(event))
 
 def fmt_duration(seconds):
     h = int(seconds) // 3600
@@ -1448,53 +1360,39 @@ class SingleStreamWatcher:
         username = self.username
         channel_id = self.channel_id
         livestream_id = self.livestream_id
-        ls_id = livestream_id or channel_id
-        ws, session = await curl_ws_connect(ws_url, headers, user_id=self.user_id)
-        
-        try:
-            # Initial handshake
-            await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-            await curl_ws_recv(ws, session, timeout=3)
-            await send_user_event(ws, channel_id, ls_id, session)
+        async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+            await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
+            try: await asyncio.wait_for(ws.recv(), timeout=5)
+            except: pass
+            await send_user_event(ws, channel_id, livestream_id)
             with self._lock: self.events_sent += 1
-            log(f"[WATCH] Connected @{username} channel_id={channel_id} livestream_id={ls_id}")
-            
-            counter = 0
+            log(f"[WATCH] Connected @{username} channel_id={channel_id} livestream_id={livestream_id}")
             last_ue = time.time()
+            last_ping = time.time()
             last_alive = time.time()
             last_refresh = time.time()
             watch_start = time.time()
-            ue_interval = 30  # user_event every 30s for faster counting
-            
+            ue_interval = random.randint(45, 65)  # Jitter: 45-65s instead of exactly 60s
             while not self.stop_event.is_set():
-                counter += 1
                 now = time.time()
                 elapsed_since_start = now - watch_start
-                
-                # Alternate ping/channel_handshake every 13-18s
-                if counter % 2 == 0:
-                    await curl_ws_send(ws, json.dumps({"type": "ping"}), session)
-                else:
-                    await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-                
-                await curl_ws_recv(ws, session, timeout=1.0)
-                await asyncio.sleep(5)  # Keepalive every 5s
-                
-                now = time.time()
-                elapsed_since_start = now - watch_start
-                
-                # user_event every 60s
+                if now - last_ping >= 20:
+                    try:
+                        await ws.send(json.dumps({"type": "ping"}))
+                        last_ping = now
+                        try: await asyncio.wait_for(ws.recv(), timeout=3)
+                        except: pass
+                    except: pass
                 if now - last_ue >= ue_interval:
-                    await send_user_event(ws, channel_id, ls_id, session)
+                    await send_user_event(ws, channel_id, livestream_id)
                     with self._lock:
                         self.events_sent += 1
                         self.watch_time += 60
                     last_ue = now
-                    ue_interval = 30  # user_event every 30s for faster counting
+                    ue_interval = random.randint(45, 65)  # Re-randomize for next interval
                     if elapsed_since_start >= 60:
                         smart_claim_check(username, user_id=self.user_id)
                     log(f"[WATCH] event #{self.events_sent} @{username} ({fmt_duration(self.watch_time)})")
-                
                 if now - last_refresh >= 300:
                     last_refresh = now
                     try:
@@ -1503,20 +1401,15 @@ class SingleStreamWatcher:
                             if info["livestream_id"] != livestream_id:
                                 livestream_id = info["livestream_id"]
                                 self.livestream_id = livestream_id
-                                ls_id = livestream_id
                                 log(f"[WATCH] Updated livestream_id={livestream_id} for @{username}")
                     except: pass
-                
                 if now - last_alive >= 300:
                     last_alive = now
                     info = get_channel_info(username)
                     if not info or not info.get("is_live"):
                         log(f"[WATCH] @{username} offline")
                         return
-        finally:
-            if session:
-                try: await session.close()
-                except: pass
+                await asyncio.sleep(1)
 
 # Per-user watchers: each user gets their own SingleWatcher
 single_watchers = {}  # user_id -> SingleWatcher
@@ -1723,45 +1616,36 @@ class StreamWatcher:
         username = self.username
         channel_id = self.channel_id
         livestream_id = self.livestream_id
-        ls_id = livestream_id or channel_id
-        ws, session = await curl_ws_connect(ws_url, headers)
-        
-        try:
-            await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-            await curl_ws_recv(ws, session, timeout=3)
-            await send_user_event(ws, channel_id, ls_id, session)
-            log(f"[SW] Connected @{username} channel_id={channel_id} livestream_id={ls_id}")
-            
+        async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+            await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
+            try: await asyncio.wait_for(ws.recv(), timeout=5)
+            except: pass
+            await send_user_event(ws, channel_id, livestream_id)
+            log(f"[SW] Connected @{username} channel_id={channel_id} livestream_id={livestream_id}")
             start = time.time()
             last_ue = time.time()
+            last_ping = time.time()
             last_refresh = time.time()
             ev_count = 1
-            ue_interval = 30  # user_event every 30s for faster counting
-            counter = 0
-            
+            ue_interval = random.randint(45, 65)  # Jitter
             while not self.stop_event.is_set():
-                counter += 1
                 now = time.time()
                 elapsed = now - start
                 if elapsed >= self.target_seconds:
                     log(f"[SW] Done @{username} ({int(elapsed)}s)")
                     return
-                
-                if counter % 2 == 0:
-                    await curl_ws_send(ws, json.dumps({"type": "ping"}), session)
-                else:
-                    await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-                
-                await curl_ws_recv(ws, session, timeout=1.0)
-                await asyncio.sleep(5)  # Keepalive every 5s
-                
-                now = time.time()
-                elapsed = now - start
+                if now - last_ping >= 20:
+                    try:
+                        await ws.send(json.dumps({"type": "ping"}))
+                        last_ping = now
+                        try: await asyncio.wait_for(ws.recv(), timeout=3)
+                        except: pass
+                    except: pass
                 if now - last_ue >= ue_interval:
-                    await send_user_event(ws, channel_id, ls_id, session)
+                    await send_user_event(ws, channel_id, livestream_id)
                     ev_count += 1
                     last_ue = now
-                    ue_interval = 30  # user_event every 30s for faster counting
+                    ue_interval = random.randint(45, 65)  # Re-randomize
                     remaining = int(self.target_seconds - elapsed)
                     log(f"[SW] event #{ev_count} @{username} ({remaining}s left)")
                 if now - last_refresh >= 300:
@@ -1772,7 +1656,6 @@ class StreamWatcher:
                             if info["livestream_id"] != livestream_id:
                                 livestream_id = info["livestream_id"]
                                 self.livestream_id = livestream_id
-                                ls_id = livestream_id
                                 log(f"[SW] Updated livestream_id={livestream_id} for @{username}")
                     except: pass
                 if ev_count % 5 == 0:
@@ -1780,10 +1663,6 @@ class StreamWatcher:
                     if not info or not info.get("is_live"):
                         log(f"[SW] @{username} offline")
                         return
-        finally:
-            if session:
-                try: await session.close()
-                except: pass
                 await asyncio.sleep(1)
 
 pw = ParallelWatcher()
@@ -1946,20 +1825,23 @@ class SlotsWatcher:
             log(f"[SW] Done @{username}")
     
     async def _ws_loop(self, ws_url, headers, username, channel_id, livestream_id, stop_event, target_seconds):
-        """WebSocket loop using curl_cffi (Chrome TLS) + kickautodrops pattern."""
+        """WebSocket loop: send events every 60s until target reached."""
         ls_id = livestream_id or channel_id
-        ws, session = await curl_ws_connect(ws_url, headers)
         
-        try:
-            # Initial handshake
-            await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-            await curl_ws_recv(ws, session, timeout=3)
+        async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+            # Handshake
+            await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
+            try: await asyncio.wait_for(ws.recv(), timeout=5)
+            except: pass
+            
+            # Send first user event
+            await send_user_event(ws, channel_id, ls_id)
             log(f"[SW] Connected @{username}")
             
             start = time.time()
             last_ue = time.time()
-            ue_interval = 30  # user_event every 30s for faster counting
-            counter = 0
+            last_ping = time.time()
+            ue_interval = random.randint(45, 65)  # Jitter
             
             while not stop_event.is_set():
                 now = time.time()
@@ -1969,33 +1851,28 @@ class SlotsWatcher:
                     log(f"[SW] @{username} done ({int(elapsed)}s)")
                     return
                 
-                # Alternate ping/channel_handshake every 13-18s
-                counter += 1
-                if counter % 2 == 0:
-                    await curl_ws_send(ws, json.dumps({"type": "ping"}), session)
-                else:
-                    await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
+                # Ping every 20s
+                if now - last_ping >= 20:
+                    try:
+                        await ws.send(json.dumps({"type": "ping"}))
+                        last_ping = now
+                        try: await asyncio.wait_for(ws.recv(), timeout=3)
+                        except: pass
+                    except: pass
                 
-                await curl_ws_recv(ws, session, timeout=1.0)
-                await asyncio.sleep(5)  # Keepalive every 5s
-                
-                # user_event every 60s
-                now = time.time()
-                elapsed = now - start
+                # User event with jitter + auto claim check
                 if now - last_ue >= ue_interval:
-                    await send_user_event(ws, channel_id, ls_id, session)
+                    await send_user_event(ws, channel_id, ls_id)
                     last_ue = now
-                    ue_interval = 30  # user_event every 30s for faster counting
+                    ue_interval = random.randint(45, 65)  # Re-randomize
                     remaining = int(target_seconds - elapsed)
                     log(f"[SW] @{username} event ({remaining}s left)")
+                    # Auto-claim check after first minute of watching
                     if elapsed >= 60:
                         try:
                             smart_claim_check(username)
-                        except: pass
-        finally:
-            if session:
-                try: await session.close()
-                except: pass
+                        except Exception as e:
+                            log(f"[SW] Claim check error @{username}: {e}")
                 
                 await asyncio.sleep(1)
     
@@ -2426,36 +2303,6 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
     elif cmd == "/watchroundstatus":
         tg_send(pw.get_status(), chat_id=chat_id)
 
-    elif cmd == "/debugws":
-        # Debug WebSocket connection
-        cookie = get_cookie(chat_id)
-        if not cookie:
-            tg_send("<b>DEBUG:</b> No cookie set!", chat_id=chat_id)
-            return
-        
-        # Test WS token
-        ws_token = get_ws_token(cookie)
-        if not ws_token:
-            tg_send(f"<b>DEBUG:</b>\nCookie: {len(cookie)} chars\nWS Token: <b>FAILED</b>\n\nCookie may be expired!", chat_id=chat_id)
-            return
-        
-        # Check token length
-        token_ok = len(ws_token) > 50
-        token_warn = "\n\n⚠️ Token too short! May be invalid." if not token_ok else ""
-        
-        # Test with a live channel (use slots streamers)
-        slots = get_slots_streamers()
-        test_channel = slots[0]["username"] if slots else None
-        
-        if test_channel:
-            info = get_channel_info(test_channel)
-            if info and info.get("is_live"):
-                tg_send(f"<b>DEBUG:</b>\nCookie: {len(cookie)} chars\nWS Token: {len(ws_token)} chars {'✅' if token_ok else '❌'}\nTest Channel: @{test_channel} (live: ✅)\n\nTry /watchtest {test_channel}", chat_id=chat_id)
-            else:
-                tg_send(f"<b>DEBUG:</b>\nCookie: {len(cookie)} chars\nWS Token: {len(ws_token)} chars {'✅' if token_ok else '❌'}\nTest Channel: @{test_channel} (offline){token_warn}", chat_id=chat_id)
-        else:
-            tg_send(f"<b>DEBUG:</b>\nCookie: {len(cookie)} chars\nWS Token: {len(ws_token)} chars {'✅' if token_ok else '❌'}\nNo live channels found{token_warn}", chat_id=chat_id)
-    
     elif cmd == "/watchtest":
         parts = text.split()
         if len(parts) < 2:
@@ -2760,23 +2607,22 @@ def _test_watch_loop(slug, channel_id, livestream_id, stop_event, duration_secs)
     log(f"[TEST] Stopped watching @{slug} ({events_sent} events sent)")
 
 async def _test_ws_loop(ws_url, headers, slug, channel_id, livestream_id, stop_event, duration_secs, start_time):
-    """WS loop for test watching using curl_cffi + kickautodrops pattern."""
+    """WS loop for test watching."""
     ls_id = livestream_id or channel_id
-    ws, session = await curl_ws_connect(ws_url, headers)
     
-    try:
-        await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-        await curl_ws_recv(ws, session, timeout=3)
-        await send_user_event(ws, channel_id, ls_id, session)
+    async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+        await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
+        try: await asyncio.wait_for(ws.recv(), timeout=5)
+        except: pass
+        await send_user_event(ws, channel_id, ls_id)
         log(f"[TEST] Connected @{slug} channel_id={channel_id}")
         
         last_ue = time.time()
+        last_ping = time.time()
         events_sent = 1
-        ue_interval = 30  # user_event every 30s for faster counting
-        counter = 0
+        ue_interval = random.randint(45, 65)  # Jitter
         
         while not stop_event.is_set():
-            counter += 1
             now = time.time()
             elapsed = now - start_time
             
@@ -2784,27 +2630,21 @@ async def _test_ws_loop(ws_url, headers, slug, channel_id, livestream_id, stop_e
                 log(f"[TEST] @{slug} - time up")
                 return
             
-            if counter % 2 == 0:
-                await curl_ws_send(ws, json.dumps({"type": "ping"}), session)
-            else:
-                await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
+            if now - last_ping >= 20:
+                try:
+                    await ws.send(json.dumps({"type": "ping"}))
+                    last_ping = now
+                    try: await asyncio.wait_for(ws.recv(), timeout=3)
+                    except: pass
+                except: pass
             
-            await curl_ws_recv(ws, session, timeout=1.0)
-            await asyncio.sleep(5)  # Keepalive every 5s
-            
-            now = time.time()
-            elapsed = now - start_time
             if now - last_ue >= ue_interval:
-                await send_user_event(ws, channel_id, ls_id, session)
+                await send_user_event(ws, channel_id, ls_id)
                 events_sent += 1
                 last_ue = now
-                ue_interval = 30  # user_event every 30s for faster counting
+                ue_interval = random.randint(45, 65)  # Re-randomize
                 remaining = int(duration_secs - elapsed)
                 log(f"[TEST] @{slug} event #{events_sent} ({remaining//60}m left)")
-    finally:
-        if session:
-            try: await session.close()
-            except: pass
             
             await asyncio.sleep(1)
 
@@ -3141,62 +2981,57 @@ class DropHunter:
                 time.sleep(5)
     
     async def _ws_loop(self, ws_url, headers, slug, channel_id, livestream_id, stop_event):
-        """WS connection using curl_cffi (Chrome TLS) + kickautodrops pattern:
-        - Alternate ping/channel_handshake every 13-18s
-        - user_event every 60s
-        """
-        ls_id = livestream_id or channel_id
-        ws, session = await curl_ws_connect(ws_url, headers)
+        """WS connection: handshake + user_events every 60s"""
+        import websockets
         
-        try:
-            # Initial handshake
-            await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-            await curl_ws_recv(ws, session, timeout=3)
+        ls_id = livestream_id or channel_id
+        
+        async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+            # Handshake
+            await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
+            try: await asyncio.wait_for(ws.recv(), timeout=5)
+            except asyncio.TimeoutError: pass
+            except Exception as e: log(f"[DH] Handshake recv error @{slug}: {e}")
             
-            counter = 0
+            # Initial user_event
+            await send_user_event(ws, channel_id, ls_id)
+            
             last_ue = time.time()
+            last_ping = time.time()
             last_refresh = time.time()
-            ue_interval = 30  # user_event every 30s for faster counting
+            ue_interval = random.randint(45, 65)  # Jitter
             
             while not stop_event.is_set():
-                counter += 1
-                
-                # Alternate between ping and channel_handshake (kickautodrops pattern)
-                if counter % 2 == 0:
-                    await curl_ws_send(ws, json.dumps({"type": "ping"}), session)
-                else:
-                    await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-                
-                # Wait for response
-                await curl_ws_recv(ws, session, timeout=1.0)
-                
-                # Random delay 13-18 seconds (kickautodrops pattern)
-                delay = 5  # Keepalive every 5s
-                await asyncio.sleep(delay)
-                
-                # user_event every 60s
                 now = time.time()
+                
+                if now - last_ping >= 20:
+                    try:
+                        await ws.send(json.dumps({"type": "ping"}))
+                        last_ping = now
+                        try: await asyncio.wait_for(ws.recv(), timeout=3)
+                        except asyncio.TimeoutError: pass
+                        except Exception as e: log(f"[DH] Ping recv error @{slug}: {e}")
+                    except Exception as e: log(f"[DH] Ping send error @{slug}: {e}")
+                
                 if now - last_ue >= ue_interval:
-                    # Refresh livestream_id every 5 min
+                    # Refresh livestream_id
                     if now - last_refresh >= 300:
                         last_refresh = now
                         try:
                             fresh = get_channel_info(slug)
                             if fresh and fresh.get("livestream_id"):
                                 ls_id = fresh["livestream_id"]
-                        except: pass
+                        except Exception as e: log(f"[DH] Refresh error @{slug}: {e}")
                     
-                    await send_user_event(ws, channel_id, ls_id, session)
+                    await send_user_event(ws, channel_id, ls_id)
                     last_ue = now
-                    ue_interval = 30  # user_event every 30s for faster counting
+                    ue_interval = random.randint(45, 65)  # Re-randomize
                     
                     with self._lock:
                         if slug in self.watching_channels:
                             self.watching_channels[slug]["events_sent"] = self.watching_channels[slug].get("events_sent", 0) + 1
-        finally:
-            if session:
-                try: await session.close()
-                except: pass
+                
+                await asyncio.sleep(1)
     
     def _is_active_hours(self):
         """Check if current time is within active hours (4 AM - 10 AM IST)."""
@@ -3475,10 +3310,9 @@ def poller():
 def main():
     global COOKIE_VALIDATED
     log("=" * 50)
-    log("KICK STAKE DROPS BOT v29 - CURL_CFFI WS + AUTH FIX")
+    log("KICK STAKE DROPS BOT v26 - TLS FINGERPRINT FIX")
     log("=" * 50)
-    log(f"tls_client: {'ACTIVE (HTTP bypass)' if HAS_TLS_CLIENT else 'DISABLED'}")
-    log(f"curl_cffi WS: {'Chrome 120 TLS ACTIVE' if HAS_CURL_CFFI else 'DISABLED (watch time may not count!)'}")
+    log(f"tls_client: {'Chrome 120 fingerprint ACTIVE' if HAS_TLS_CLIENT else 'DISABLED (bot detection likely!)'}")
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
     log(f"Dashboard: port {DASHBOARD_PORT} (user: {DASH_USER})")
     
