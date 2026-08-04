@@ -1963,7 +1963,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         
         # Determine source
         source = "Unknown"
-        if INITIAL_COOKIE and get_cookie() == urllib.parse.unquote(INITIAL_COOKIE):
+        if INITIAL_COOKIE and get_cookie() == _urlparse.unquote(INITIAL_COOKIE):
             source = "🌐 ENV VAR (KICK_COOKIE)"
         elif USE_SUPABASE:
             try:
