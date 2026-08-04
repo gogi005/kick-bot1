@@ -1,6 +1,7 @@
 """
 Kick Stake Drops Bot v25 - TIME WINDOW + TEST MODE
-- ACTIVE HOURS: 4 AM to 10 AM IST (auto watch)
+- ACTIVE HOURS: 2 AM to 11 AM IST (auto watch)
+- POLLING: 24/7 every 5 seconds (always detects new drops)
 - MANUAL: /watchtest works 24/7
 - TEST: /startwatching watches all known live for 1 hour
 - TELEGRAM USERNAMES: Shows @username when users join
@@ -32,13 +33,13 @@ INITIAL_COOKIE = os.environ.get("KICK_COOKIE", "")
 COOKIE_VALIDATED = False  # Set to True after successful validation
 DASH_USER = os.environ.get("DASH_USER", "admin")
 DASH_PASS = os.environ.get("DASH_PASS", "kickbot2026")
-POLL_INTERVAL = 2
+POLL_INTERVAL = 5
 AUTO_WATCH_LIMIT = 1800  # 30 minutes per channel
 USER_PREF_LIMIT = None  # No limit for user preferences
 MAX_PARALLEL_STREAMS = 10  # Max parallel streams in auto mode
 # TIME WINDOW: Only watch during drop hours (IST)
-WATCH_START_HOUR = 4   # 4:00 AM IST
-WATCH_END_HOUR = 10    # 10:00 AM IST
+WATCH_START_HOUR = 2   # 2:00 AM IST
+WATCH_END_HOUR = 11    # 11:00 AM IST
 IST_OFFSET = timedelta(hours=5, minutes=30)
 DROPS_API = "https://web.kick.com/api/v1/drops/campaigns"
 PROGRESS_API = "https://web.kick.com/api/v1/drops/progress"
@@ -1996,45 +1997,48 @@ class DropHunter:
         # Step 1: On startup, discover ALL channels
         self._discover_all_channels()
         
+        # ALWAYS do an immediate first poll (don't wait for active hours)
+        log(f"[DH] Doing immediate first poll...")
+        self._poll_and_watch()
+        
         # Log time window status
         if self._is_active_hours():
-            log(f"[DH] Starting in ACTIVE HOURS (4AM-10AM IST) - watching channels!")
+            log(f"[DH] Starting in ACTIVE HOURS (2AM-11AM IST) - watching + polling!")
             self._start_watching_all_known()
         else:
             from datetime import timezone
             utc_now = datetime.now(timezone.utc)
             ist_now = utc_now + IST_OFFSET
-            log(f"[DH] Outside active hours (IST: {ist_now.strftime('%H:%M')}) - will start watching at 4 AM IST")
+            log(f"[DH] Outside active hours (IST: {ist_now.strftime('%H:%M')}) - polling 24/7 for notifications, watching at 2 AM IST")
         
-        # Step 3: Continuous polling loop
+        # Step 3: Continuous polling loop - ALWAYS POLL for notifications
+        # Watching (WS connections) only during active hours
         was_active = self._is_active_hours()
         while self.active:
             try:
                 is_now_active = self._is_active_hours()
                 
-                if not is_now_active:
-                    # OUTSIDE ACTIVE HOURS: Sleep 5 min, no polling
-                    if was_active:
-                        log(f"[DH] leaving active hours - stopping watches")
-                        with self._lock:
-                            for slug in list(self.watching_channels.keys()):
-                                self.watching_channels[slug]["stop_event"].set()
-                                del self.watching_channels[slug]
-                        log(f"[DH] All watches stopped for the night")
-                        was_active = False
-                    time.sleep(300)  # Sleep 5 min outside hours
-                    continue
+                # Stop watchers when leaving active hours
+                if not is_now_active and was_active:
+                    log(f"[DH] leaving active hours - stopping watches (still polling)")
+                    with self._lock:
+                        for slug in list(self.watching_channels.keys()):
+                            self.watching_channels[slug]["stop_event"].set()
+                            del self.watching_channels[slug]
+                    log(f"[DH] All watches stopped for the night")
+                    was_active = False
                 
-                # INSIDE ACTIVE HOURS: Fast polling (2s)
-                if not was_active:
-                    log(f"[DH] entering ACTIVE HOURS (4AM-10AM IST) - starting watches!")
+                # Start watching when entering active hours
+                if is_now_active and not was_active:
+                    log(f"[DH] entering ACTIVE HOURS (2AM-11AM IST) - starting watches!")
                     self._start_watching_all_known()
                     was_active = True
                 
+                # ALWAYS poll for drops, notifications, claims (24/7)
                 self._poll_and_watch()
             except Exception as e:
                 log(f"[DH] Error: {e}")
-            time.sleep(POLL_INTERVAL)
+            time.sleep(POLL_INTERVAL)  # 5s always — 24/7 polling
     
     def _discover_all_channels(self):
         """Discover ALL channels from campaigns + watchlist + user preferences."""
@@ -2261,8 +2265,8 @@ class DropHunter:
         log(f"[DH] WATCHING {len(watching)} streamers: {', '.join(lines)}")
     
     def _poll_and_watch(self):
-        """Check campaigns, start watching ALL channels, claim instantly.
-        Called only during active hours (4AM-10AM IST)."""
+        """Check campaigns, detect drops, send notifications, claim rewards.
+        Always runs 24/7 for notifications. WS watching gated by active hours."""
         # Log watching status every minute
         self._log_watching_status()
         
@@ -2327,12 +2331,12 @@ class DropHunter:
                     log(f"[DH] NEW ACTIVE STAKE DROP (not pre-watched): {name} - will claim after 30s")
                     tg_send(f"<b>🎯 STAKE DROP ACTIVE!</b>\n<b>{name}</b>\nClaim window: {fmt_countdown(end_at)}\nBot watching + claiming!")
                 
-                # Start watching ALL channels for this drop
+                # Start watching ALL channels for this drop (if in active hours)
                 for ch in channels:
                     slug = ch.get("slug") or (ch.get("user") or {}).get("username", "")
                     if not slug: continue
                     
-                    if slug not in self.watching_channels:
+                    if slug not in self.watching_channels and self._is_active_hours():
                         cid_val = ch.get("id") or (ch.get("user") or {}).get("id")
                         self._start_watching_channel(slug, cid_val)
                 
@@ -2376,8 +2380,8 @@ class DropHunter:
                     seconds_until = (start_time - now).total_seconds()
                 except: continue
                 
-                # Watch channels IMMEDIATELY for upcoming drops (start watching NOW)
-                if seconds_until > 0:
+                # Watch channels IMMEDIATELY for upcoming drops (if in active hours)
+                if seconds_until > 0 and self._is_active_hours():
                     for ch in channels:
                         slug = ch.get("slug") or (ch.get("user") or {}).get("username", "")
                         if slug and slug not in self.watching_channels:
@@ -2411,7 +2415,7 @@ class DropHunter:
                 if not self.active: break
                 if slug in self.watching_channels: continue
                 info = get_channel_info(slug)
-                if info and info.get("is_live"):
+                if info and info.get("is_live") and self._is_active_hours():
                     self._start_watching_channel(slug, info.get("channel_id"))
                     time.sleep(0.3)
             self._check_idx = (check_start + 3) % len(known_list)
