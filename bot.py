@@ -1390,8 +1390,6 @@ class SingleStreamWatcher:
                         self.watch_time += 60
                     last_ue = now
                     ue_interval = random.randint(45, 65)  # Re-randomize for next interval
-                    if elapsed_since_start >= 60:
-                        smart_claim_check(username, user_id=self.user_id)
                     log(f"[WATCH] event #{self.events_sent} @{username} ({fmt_duration(self.watch_time)})")
                 if now - last_refresh >= 300:
                     last_refresh = now
@@ -1566,9 +1564,6 @@ class ParallelWatcher:
                     follow_channel(username)
                     log(f"[PW] Started @{username} for {watch_min} min")
                     tg_send(f"<b>PW:</b> Watching @{username} ({watch_min} min)")
-
-                # Smart claim check after starting watchers
-                smart_claim_check()
 
                 time.sleep(30)
 
@@ -1764,7 +1759,7 @@ class SlotsWatcher:
                     
                     stop_evt = threading.Event()
                     t = threading.Thread(
-                        target=self._watch_one,
+                        target=self._watch_one_sync,
                         args=(username, cid, lsid, watch_seconds, stop_evt),
                         daemon=True
                     )
@@ -1794,8 +1789,8 @@ class SlotsWatcher:
         log("[SW] Slots Watcher stopped")
     
     def _watch_one_sync(self, username, channel_id, livestream_id, target_seconds, stop_event):
-        """Watch a single streamer SYNCHRONOUSLY for target_seconds.
-        Blocks until watch time is complete. Only 1 WS connection at a time."""
+        """Watch a single streamer for target_seconds (up to 10 in parallel).
+        Cleans up watching dict when done."""
         try:
             ws_token = get_ws_token(get_cookie())
             if not ws_token:
@@ -1814,6 +1809,10 @@ class SlotsWatcher:
                 loop.close()
         except Exception as e:
             log(f"[SW] Error @{username}: {e}")
+        finally:
+            with self._lock:
+                self.watching.pop(username, None)
+            log(f"[SW] Done @{username}")
     
     async def _ws_loop(self, ws_url, headers, username, channel_id, livestream_id, stop_event, target_seconds):
         """WebSocket loop: send events every 60s until target reached."""
@@ -1858,12 +1857,6 @@ class SlotsWatcher:
                     ue_interval = random.randint(45, 65)  # Re-randomize
                     remaining = int(target_seconds - elapsed)
                     log(f"[SW] event @{username} {fmt_duration(elapsed)} elapsed ({remaining}s left)")
-                    # Auto-claim check after first minute of watching
-                    if elapsed >= 60:
-                        try:
-                            smart_claim_check(username)
-                        except Exception as e:
-                            log(f"[SW] Claim check error @{username}: {e}")
                 
                 await asyncio.sleep(1)
     
