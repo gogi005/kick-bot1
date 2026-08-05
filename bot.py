@@ -127,8 +127,8 @@ def _save_logs():
     global _LOG_SAVE_TIMER
     try:
         now = time.time()
-        if USE_SUPABASE and now - _LOG_SAVE_TIMER < 30:
-            return  # Debounce: skip if saved recently
+        if USE_SUPABASE and now - _LOG_SAVE_TIMER < 10:
+            return  # Debounce: save every 10s for real-time dashboard
         _LOG_SAVE_TIMER = now
         with LOG_LOCK:
             logs_data = list(LOG_BUFFER[-200:])
@@ -388,33 +388,26 @@ def kick_request(url, extra_headers=None, timeout=15, user_id=None):
         try:
             body_snippet = e.read().decode()[:200]
         except: pass
-        vlog("KICK", f"<<< HTTP {e.code} | Body: {body_snippet}")
+        log(f"[KICK] HTTP {e.code} | {url.split('/')[-1][:30]} | {body_snippet[:80]}")
         raise
     except Exception as e:
-        vlog("KICK", f"<<< ERROR: {type(e).__name__}: {str(e)[:100]}")
+        log(f"[KICK] ERROR: {type(e).__name__}: {str(e)[:80]}")
         raise
 
 def fetch_campaigns():
-    vlog("CAMPAIGNS", f"Fetching campaigns from {DROPS_API}")
     try:
         data = kick_request(DROPS_API)
         campaigns = data.get("data", [])
-        vlog("CAMPAIGNS", f"SUCCESS: {len(campaigns)} campaigns fetched")
-        for i, c in enumerate(campaigns[:5]):
-            name = c.get('name', '?')
-            status = c.get('status', '?')
-            ch_count = len(c.get('channels', []))
-            vlog("CAMPAIGNS", f"  [{i}] {name} | status={status} | channels={ch_count}")
         return campaigns, True
     except urllib.error.HTTPError as e:
         body = ""
         try: body = e.read().decode()[:200]
         except: pass
-        vlog("CAMPAIGNS", f"FAILED: HTTP {e.code} | Body: {body}")
+        log(f"[CAMPAIGNS] HTTP {e.code}: {body[:100]}")
         if e.code in (401, 403): return None, False
         return None, True
     except Exception as e:
-        vlog("CAMPAIGNS", f"FAILED: {type(e).__name__}: {str(e)[:100]}")
+        log(f"[CAMPAIGNS] ERROR: {type(e).__name__}: {str(e)[:100]}")
         return None, True
 
 def get_channel_info(username):
@@ -2222,8 +2215,9 @@ class DropHunter:
                 consecutive_errors = 0  # Reset on success
             except Exception as e:
                 consecutive_errors += 1
-                vlog("DH", f"Loop error #{consecutive_errors}: {type(e).__name__}: {str(e)[:100]}")
-                log(f"[DH] Error: {e}")
+                tb = traceback.format_exc()[-200:]  # Last 200 chars of traceback
+                log(f"[DH] ERROR #{consecutive_errors}: {type(e).__name__}: {str(e)[:100]}")
+                log(f"[DH] TRACEBACK: {tb}")
                 if consecutive_errors > 10:
                     log(f"[DH] Too many errors ({consecutive_errors}), waiting 30s before retry")
                     time.sleep(30)
@@ -2472,33 +2466,46 @@ class DropHunter:
         with self._lock:
             watching = dict(self.watching_channels)
         if not watching:
-            log(f"[DH] WATCH STATUS: Not watching any streamers")
-            return
+            return  # Don't log when idle - poll logs already show "Watching: 0"
         lines = []
         for slug, info in watching.items():
             elapsed = int(time.time() - info.get("started_at", time.time()))
             events = info.get("events_sent", 0)
-            cid = info.get("channel_id", "?")
-            lines.append(f"@{slug} (ID:{cid}) {elapsed//60}m {events}ev")
-        log(f"[DH] WATCHING {len(watching)} streamers: {', '.join(lines)}")
+            lines.append(f"@{slug} {elapsed//60}m {events}ev")
+        log(f"[DH] WATCHING {len(watching)}: {', '.join(lines)}")
     
     def _poll_and_watch(self):
         """Check campaigns, detect drops, send notifications, claim rewards.
         Always runs 24/7 for notifications. WS watching gated by active hours."""
-        vlog("POLL", f"--- Poll cycle #{self.state.get('polls', 0) + 1} ---")
-        self._log_watching_status()
+        # Increment polls counter
+        with self._lock:
+            self.state["polls"] = self.state.get("polls", 0) + 1
+            poll_count = self.state["polls"]
+            self.state["last_poll"] = datetime.now().isoformat()
+        
+        # Heartbeat log every poll (visible in dashboard)
+        watching_count = len(self.watching_channels)
+        if poll_count % 6 == 0:  # Log watching status every 30s (not every 5s)
+            self._log_watching_status()
+        else:
+            # Compact poll log every 5s
+            log(f"[DH] Poll #{poll_count} | Watching: {watching_count} | Checking drops...")
         
         campaigns, cookie_ok = fetch_campaigns()
         if not campaigns:
-            vlog("POLL", f"No campaigns. cookie_ok={cookie_ok}")
             if cookie_ok is False:
-                log("[DH] Campaigns fetch failed - cookie invalid (401/403)")
+                log(f"[DH] Poll #{poll_count} FAILED: Cookie invalid (401/403) - cannot fetch campaigns!")
+            else:
+                log(f"[DH] Poll #{poll_count}: No campaigns found (API empty or blocked)")
             return
         
         # Safety: ensure campaigns is a list of dicts
         if not isinstance(campaigns, list):
-            log(f"[DH] Unexpected campaigns type: {type(campaigns)}")
+            log(f"[DH] Poll #{poll_count} ERROR: Unexpected campaigns type: {type(campaigns)}")
             return
+        
+        # Log poll summary
+        log(f"[DH] Poll #{poll_count} OK: {len(campaigns)} campaigns | Watching: {watching_count}")
         
         for c in campaigns:
             if not self.active: break
