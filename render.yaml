@@ -1,11 +1,16 @@
 services:
-  - type: web
+  - type: worker
     name: kick-stake-drops-bot
     runtime: python
     plan: free
-    healthCheckPath: /health
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
     envVars:
+      - key: TG_TOKEN
+        value: "8860462138:AAGkQQF1c-MyTfD3-3WluZNMarcT7HLj4dg"
+      - key: ADMIN_ID
+        value: "8182391939"
+      - key: KICK_COOKIE
+        value: "365875656%7C3qeqtSAxow2mU2adRmgluNijBSImYcgoLFRIZ2v9"
       - key: DASH_USER
         value: "admin"
+      - key: DASH_PASS
+        value: "kickbot2026"
