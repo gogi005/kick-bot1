@@ -972,7 +972,7 @@ def fmt_countdown(iso_str):
     if not iso_str: return "N/A"
     try:
         target = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        diff = target - datetime.now()
+        diff = target - datetime.now(target.tzinfo)
         if diff.total_seconds() < 0: return "EXPIRED"
         days = diff.days
         hours, rem = divmod(diff.seconds, 3600)
@@ -1144,9 +1144,12 @@ def add_to_watchlist(username, added_by="manual"):
 
 def remove_from_watchlist(username):
     """Remove a channel from the watchlist."""
+    global _watchlist_local_cache
     if USE_SUPABASE:
         try:
-            return db.remove_from_watchlist_db(username)
+            result = db.remove_from_watchlist_db(username)
+            _watchlist_local_cache.discard(username.lower().strip("@").strip())
+            return result
         except Exception as e:
             print(f"[DB] remove_from_watchlist fallback: {e}")
     watchlist = load_watchlist()
@@ -1155,6 +1158,7 @@ def remove_from_watchlist(username):
         watchlist["channels"].remove(username)
         watchlist["added_by"].pop(username, None)
         save_watchlist(watchlist)
+        _watchlist_local_cache.discard(username)
         log(f"[WATCHLIST] Removed @{username}")
         return True, f"@{username} removed from watchlist!"
     return False, f"@{username} not in watchlist."
@@ -1277,6 +1281,7 @@ class SingleWatcher:
     def stop(self, reason="manual"):
         if not self.watchers:
             return False, "Not watching."
+        saved_started_at = self.started_at
         with self._lock:
             usernames = list(self.watchers.keys())
             total_events = sum(w.events_sent for w in self.watchers.values())
@@ -1287,7 +1292,7 @@ class SingleWatcher:
             self.watchers.clear()
             self.active = False
             self.started_at = None
-        elapsed = (datetime.now() - self.started_at).total_seconds() if self.started_at else 0
+        elapsed = (datetime.now() - saved_started_at).total_seconds() if saved_started_at else 0
         msg = (f"<b>ALL WATCHERS STOPPED!</b> ({reason})\n\n"
                 f"Streamers: {', '.join(['@'+u for u in usernames])}\n"
                 f"Total events: {total_events}\n"
@@ -2410,8 +2415,8 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         for ch in prefs:
             info = get_channel_info(ch)
             status = "LIVE" if info and info.get("is_live") else "offline"
-            color = "#4CAF50" if status == "LIVE" else "#999"
-            msg += f"  @{ch} - <span style='color:{color}'>{status}</span>\n"
+            status_text = f"<b>{status}</b>" if status == "LIVE" else status
+            msg += f"  @{ch} - {status_text}\n"
         msg += "\n/removestreamer &lt;username&gt; to remove"
         tg_send(msg, chat_id=chat_id)
 
@@ -2659,6 +2664,7 @@ class DropHunter:
         self.claim_retry_queue = {}  # claim_key -> {campaign_id, reward_id, slug, retries, next_retry, last_progress}
         self.failed_rewards = set()  # permanently failed - don't re-add to retry queue
         self.known_stake_campaigns = set()  # IDs of confirmed Stake drops only
+        self.state = {"polls": 0, "last_poll": None}
         self._lock = threading.Lock()
     
     def start(self):
@@ -3025,7 +3031,6 @@ class DropHunter:
             self.state["polls"] = self.state.get("polls", 0) + 1
             poll_count = self.state["polls"]
             self.state["last_poll"] = datetime.now().isoformat()
-        self._save()
         
         # Heartbeat log every poll
         watching_count = len(self.watching_channels)
