@@ -101,18 +101,22 @@ BROWSER_HEADERS = {
     "sec-ch-ua-platform": '"Windows"',
 }
 
+_tls_session = None
+
 def get_tls_session():
-    """Get a tls_client session with Chrome 120 TLS fingerprint.
-    This defeats Cloudflare JA3/JA4 TLS fingerprinting detection."""
+    """Get a PERSISTENT tls_client session with Chrome 120 TLS fingerprint."""
+    global _tls_session
     if not HAS_TLS_CLIENT:
         return None
+    if _tls_session:
+        return _tls_session
     try:
-        s = tls_client.Session(
+        _tls_session = tls_client.Session(
             client_identifier="chrome_120",
             random_tls_extension_order=True
         )
-        s.headers.update(BROWSER_HEADERS)
-        return s
+        _tls_session.headers.update(BROWSER_HEADERS)
+        return _tls_session
     except Exception as e:
         print(f"[TLS] Session error: {e}")
         return None
@@ -420,10 +424,9 @@ def fetch_campaigns(user_id=None):
             if resp.status_code == 200:
                 data = resp.json()
                 return data.get("data", []), True
-            elif resp.status_code in (401, 403):
-                return None, False
             else:
-                return None, True
+                print(f"[CAMPAIGNS] HTTP {resp.status_code}: {resp.text[:200] if hasattr(resp, 'text') else ''}")
+                return None, resp.status_code not in (401, 403)
         except Exception as e:
             print(f"[CAMPAIGNS] tls_client error: {e}")
     
@@ -432,9 +435,12 @@ def fetch_campaigns(user_id=None):
         data = kick_request(DROPS_API, user_id=user_id)
         return data.get("data", []), True
     except urllib.error.HTTPError as e:
+        print(f"[CAMPAIGNS] urllib HTTP {e.code}")
         if e.code in (401, 403): return None, False
         return None, True
-    except: return None, True
+    except Exception as e:
+        print(f"[CAMPAIGNS] urllib error: {e}")
+        return None, True
 
 def get_channel_info(username):
     """Get channel info using tls_client to bypass Cloudflare detection."""
@@ -2772,48 +2778,17 @@ class DropHunter:
         # Step 1: On startup, discover ALL channels
         self._discover_all_channels()
         
-        # ALWAYS do an immediate first poll (don't wait for active hours)
-        log(f"[DH] Doing immediate first poll...")
-        self._poll_and_watch()
+        # Step 2: Start watching all known live channels
+        self._start_watching_all_known()
         
-        # Log time window status
-        if self._is_active_hours():
-            log(f"[DH] Starting in ACTIVE HOURS (2AM-11AM IST) - watching + polling!")
-            self._start_watching_all_known()
-        else:
-            from datetime import timezone
-            utc_now = datetime.now(timezone.utc)
-            ist_now = utc_now + IST_OFFSET
-            log(f"[DH] Outside active hours (IST: {ist_now.strftime('%H:%M')}) - polling 24/7 for notifications, watching at 2 AM IST")
-        
-        # Step 3: Continuous polling loop - ALWAYS POLL for notifications
-        # Watching (WS connections) only during active hours
-        was_active = self._is_active_hours()
+        # Step 3: 24/7 polling loop — always active, never sleeps
+        log(f"[DH] 24/7 mode active - polling every {POLL_INTERVAL}s, watching all live channels")
         while self.active:
             try:
-                is_now_active = self._is_active_hours()
-                
-                # Stop watchers when leaving active hours
-                if not is_now_active and was_active:
-                    log(f"[DH] leaving active hours - stopping watches (still polling)")
-                    with self._lock:
-                        for slug in list(self.watching_channels.keys()):
-                            self.watching_channels[slug]["stop_event"].set()
-                            del self.watching_channels[slug]
-                    log(f"[DH] All watches stopped for the night")
-                    was_active = False
-                
-                # Start watching when entering active hours
-                if is_now_active and not was_active:
-                    log(f"[DH] entering ACTIVE HOURS (2AM-11AM IST) - starting watches!")
-                    self._start_watching_all_known()
-                    was_active = True
-                
-                # ALWAYS poll for drops, notifications, claims (24/7)
                 self._poll_and_watch()
             except Exception as e:
                 log(f"[DH] Error: {e}")
-            time.sleep(POLL_INTERVAL)  # 5s always — 24/7 polling
+            time.sleep(POLL_INTERVAL)
     
     def _discover_all_channels(self):
         """Discover ALL channels from campaigns + watchlist + user preferences."""
@@ -3044,18 +3019,25 @@ class DropHunter:
     
     def _poll_and_watch(self):
         """Check campaigns, detect drops, send notifications, claim rewards.
-        Always runs 24/7 for notifications. WS watching gated by active hours."""
+        Always runs 24/7 for notifications."""
         # Increment polls counter
         with self._lock:
             self.state["polls"] = self.state.get("polls", 0) + 1
+            poll_count = self.state["polls"]
             self.state["last_poll"] = datetime.now().isoformat()
         self._save()
         
-        # Log watching status every minute
-        self._log_watching_status()
+        # Heartbeat log every poll
+        watching_count = len(self.watching_channels)
+        log(f"[DH] Poll #{poll_count} | Watching: {watching_count} | Checking drops...")
         
         campaigns, cookie_ok = fetch_campaigns()
-        if not campaigns: return
+        if not campaigns:
+            if cookie_ok is False:
+                log("[DH] Campaigns fetch failed - cookie invalid (401/403)")
+            else:
+                log("[DH] No campaigns found (API returned empty or blocked)")
+            return
         
         # Safety: ensure campaigns is a list of dicts
         if not isinstance(campaigns, list):
@@ -3120,7 +3102,7 @@ class DropHunter:
                     slug = ch.get("slug") or (ch.get("user") or {}).get("username", "")
                     if not slug: continue
                     
-                    if slug not in self.watching_channels and self._is_active_hours():
+                    if slug not in self.watching_channels:
                         cid_val = ch.get("id") or (ch.get("user") or {}).get("id")
                         self._start_watching_channel(slug, cid_val)
                 
@@ -3164,8 +3146,8 @@ class DropHunter:
                     seconds_until = (start_time - now).total_seconds()
                 except: continue
                 
-                # Watch channels IMMEDIATELY for upcoming drops (if in active hours)
-                if seconds_until > 0 and self._is_active_hours():
+                # Watch channels IMMEDIATELY for upcoming drops
+                if seconds_until > 0:
                     for ch in channels:
                         slug = ch.get("slug") or (ch.get("user") or {}).get("username", "")
                         if slug and slug not in self.watching_channels:
@@ -3199,7 +3181,7 @@ class DropHunter:
                 if not self.active: break
                 if slug in self.watching_channels: continue
                 info = get_channel_info(slug)
-                if info and info.get("is_live") and self._is_active_hours():
+                if info and info.get("is_live"):
                     self._start_watching_channel(slug, info.get("channel_id"))
                     time.sleep(0.3)
             self._check_idx = (check_start + 3) % len(known_list)
