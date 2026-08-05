@@ -27,29 +27,16 @@ def get_client():
                 _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _supabase
 
-def _retry(func, max_retries=5, delay=2):
-    """Retry function on socket errors (Windows + Linux)"""
+def _retry(func, max_retries=3, delay=1):
+    """Retry function on Windows socket errors"""
     for i in range(max_retries):
         try:
             return func()
         except Exception as e:
             err_str = str(e).lower()
-            # Windows: non-blocking socket, WSAEWOULDBLOCK (10035)
-            # Linux: [Errno 11] Resource temporarily unavailable (EAGAIN/EWOULDBLOCK)
-            is_socket_err = (
-                'non-blocking' in err_str or
-                'winerror' in err_str or
-                '10035' in err_str or
-                'errno 11' in err_str or
-                'resource temporarily unavailable' in err_str or
-                'eagain' in err_str or
-                'ewouldblock' in err_str
-            )
-            if is_socket_err:
+            if 'non-blocking' in err_str or 'winerror' in err_str or '10035' in err_str:
                 if i < max_retries - 1:
-                    wait = delay * (i + 1)  # Exponential backoff
-                    print(f"[DB] Socket error (attempt {i+1}/{max_retries}), retrying in {wait}s: {str(e)[:80]}")
-                    time.sleep(wait)
+                    time.sleep(delay)
                     continue
             raise
 
@@ -382,8 +369,7 @@ def save_user_cookie(user_id, cookie, kick_username=None, kick_user_id=None):
         else:
             data["added_at"] = datetime.now().isoformat()
             client.table("user_cookies").insert(data).execute()
-        print(f"[DB] Saved cookie for user {user_id} (@{kick_username}) - cookie length: {len(cookie)} chars")
-        print(f"[DB] Cookie preview: {cookie[:15]}...{cookie[-5:] if len(cookie) > 20 else cookie}")
+        print(f"[DB] Saved cookie for user {user_id} (@{kick_username})")
         return True
     try:
         return _retry(_do)
@@ -402,10 +388,8 @@ def get_user_cookie(user_id):
             client.table("user_cookies").update({
                 "last_used": datetime.now().isoformat()
             }).eq("user_id", int(user_id)).execute()
-            cookie_val = row.get("cookie", "")
-            print(f"[DB] get_user_cookie({user_id}): cookie_len={len(cookie_val)}, preview={cookie_val[:15]}...{cookie_val[-5:] if len(cookie_val) > 20 else cookie_val}")
             return {
-                "cookie": cookie_val,
+                "cookie": row.get("cookie"),
                 "kick_username": row.get("kick_username"),
                 "kick_user_id": row.get("kick_user_id")
             }
@@ -438,20 +422,6 @@ def remove_user_cookie(user_id):
         return _retry(_do)
     except Exception as e:
         print(f"[DB] remove_user_cookie error: {e}")
-        return False
-
-def remove_all_user_cookies():
-    """Remove ALL user cookies - admin command to reset everyone to global cookie"""
-    def _do():
-        client = get_client()
-        # Delete all rows from user_cookies table
-        result = client.table("user_cookies").delete().neq("user_id", 0).execute()
-        print(f"[DB] Removed all user cookies")
-        return True
-    try:
-        return _retry(_do)
-    except Exception as e:
-        print(f"[DB] remove_all_user_cookies error: {e}")
         return False
 
 # ==================== USER PREFERENCES (Custom Streamers) ====================
