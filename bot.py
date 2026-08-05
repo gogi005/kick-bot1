@@ -14,8 +14,40 @@ Kick Stake Drops Bot v25 - TIME WINDOW + TEST MODE
 import urllib.request, json, time, os, threading, random, hashlib
 import asyncio
 import websockets
+import traceback
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ============ HEAVY DEBUGGING ============
+VERBOSE_DEBUG = True  # Set True for maximum logging
+
+def vlog(tag, msg):
+    """Verbose debug log - only when VERBOSE_DEBUG is True"""
+    if VERBOSE_DEBUG:
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        try:
+            print(f"[V][{ts}][{tag}] {msg}", flush=True)
+        except UnicodeEncodeError:
+            safe = f"[V][{ts}][{tag}] {msg}".encode('ascii', errors='replace').decode('ascii')
+            print(safe, flush=True)
+
+def dbg_request(tag, url, headers=None, method="GET", body=None):
+    """Debug log for HTTP requests - sanitized (no cookie value)"""
+    if not VERBOSE_DEBUG: return
+    safe_headers = {}
+    if headers:
+        for k, v in headers.items():
+            if k.lower() == 'cookie':
+                safe_headers[k] = f'session=***({len(v)-8}chars)***' if len(v) > 8 else 'session=***'
+            elif k.lower() == 'authorization':
+                safe_headers[k] = f'Bearer ***({len(v)-7}chars)***' if len(v) > 7 else 'Bearer ***'
+            else:
+                safe_headers[k] = str(v)[:80]
+    vlog(tag, f">>> {method} {url}")
+    if safe_headers:
+        vlog(tag, f"    Headers: {json.dumps(safe_headers, default=str)[:300]}")
+    if body:
+        vlog(tag, f"    Body: {str(body)[:200]}")
 
 # Supabase database module (persistent storage)
 try:
@@ -128,25 +160,34 @@ import urllib.parse as _urlparse
 # Priority: User-specific > Admin env var > Supabase global > local file
 def get_cookie(user_id=None):
     """Get cookie DECODED: user cookie > admin env cookie > Supabase > file"""
+    vlog("COOKIE", f"get_cookie(user_id={user_id}) called")
     raw = ""
+    source = "none"
     # 1. User-specific cookie (if user called /setcookie)
     if user_id and USE_SUPABASE:
         try:
             user_data = db.get_user_cookie(user_id)
             if user_data and user_data.get("cookie"):
                 raw = user_data["cookie"]
+                source = f"user_db(id={user_id})"
+                vlog("COOKIE", f"Found user cookie from DB: {len(raw)} chars")
         except Exception as e:
             print(f"[DB] get_user_cookie error: {e}")
     
     # 2. Admin env var cookie (KICK_COOKIE) — ALWAYS use this as default
     if not raw and INITIAL_COOKIE:
         raw = INITIAL_COOKIE
+        source = "ENV_KICK_COOKIE"
+        vlog("COOKIE", f"Using ENV KICK_COOKIE: {len(raw)} chars")
     
     # 3. Supabase global cookie (old fallback)
     if not raw and USE_SUPABASE:
         try:
             c = db.load_cookie_db()
-            if c: raw = c
+            if c:
+                raw = c
+                source = "supabase_global"
+                vlog("COOKIE", f"Using Supabase global: {len(raw)} chars")
         except Exception as e:
             print(f"[DB] get_cookie fallback: {e}")
     
@@ -155,11 +196,17 @@ def get_cookie(user_id=None):
         try:
             with open(COOKIE_FILE) as f:
                 raw = json.load(f).get("cookie", "")
+                if raw:
+                    source = "local_file"
+                    vlog("COOKIE", f"Using local file: {len(raw)} chars")
         except: pass
     
     # ALWAYS decode: %7C → | (Kick needs decoded cookie)
     if raw:
-        return _urlparse.unquote(raw)
+        decoded = _urlparse.unquote(raw)
+        vlog("COOKIE", f"Source: {source}, raw={len(raw)}chars, decoded={len(decoded)}chars, first10='{decoded[:10]}...'")
+        return decoded
+    vlog("COOKIE", "NO COOKIE FOUND! Returning empty string")
     return ""
 
 def save_cookie(cookie):
@@ -179,29 +226,40 @@ def session_keeper():
     log("Session keeper started")
     while True:
         try:
+            vlog("KEEPER", f"--- Keepalive check (interval={KEEPER_INTERVAL}s) ---")
             cookie = get_cookie()
             if not cookie:
+                vlog("KEEPER", "No cookie found!")
                 log("[KEEPER] No cookie to refresh - USE /setcookie to add one!")
                 tg_send_admin("<b>⚠️ NO COOKIE SET!</b>\nUse /setcookie to update.")
                 time.sleep(KEEPER_INTERVAL)
                 continue
             
+            vlog("KEEPER", f"Testing cookie: {len(cookie)} chars, first10='{cookie[:10]}...'")
             headers = dict(BASE_HEADERS)
             headers["Cookie"] = "session=" + cookie
             headers["Authorization"] = f"Bearer {cookie}"
             headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+            dbg_request("KEEPER", "https://kick.com/api/v2/users/me", headers, "GET")
             req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
             resp = urllib.request.urlopen(req, timeout=15)
             data = json.loads(resp.read().decode())
+            vlog("KEEPER", f"Response keys: {list(data.keys())[:8]}")
             
             if data.get("username"):
                 log(f"[KEEPER] Session alive - @{data['username']}")
+                vlog("KEEPER", f"Cookie VALID for @{data['username']} (id={data.get('id', '?')})")
                 COOKIE_VALIDATED = True
             else:
                 log("[KEEPER] Cookie valid but no user data")
+                vlog("KEEPER", f"Cookie valid but no username. Full response: {json.dumps(data, default=str)[:200]}")
                 COOKIE_VALIDATED = True
             
         except urllib.error.HTTPError as e:
+            resp_body = ""
+            try: resp_body = e.read().decode()[:200]
+            except: pass
+            vlog("KEEPER", f"HTTP {e.code} | Body: {resp_body}")
             if e.code == 401:
                 log("[KEEPER] Cookie EXPIRED! Use /setcookie to update.")
                 COOKIE_VALIDATED = False
@@ -212,6 +270,7 @@ def session_keeper():
             else:
                 log(f"[KEEPER] HTTP {e.code}")
         except Exception as e:
+            vlog("KEEPER", f"EXCEPTION: {type(e).__name__}: {str(e)[:100]}")
             log(f"[KEEPER] Error: {str(e)[:80]}")
         time.sleep(KEEPER_INTERVAL)
 
@@ -265,18 +324,24 @@ def get_active_subs():
 
 # ---- Telegram ----
 def tg_send(text, parse_mode="HTML", chat_id=None):
-    if not TG_TOKEN: return
+    if not TG_TOKEN:
+        vlog("TG", "No TG_TOKEN set!")
+        return
     targets = [chat_id] if chat_id else get_active_subs()
+    vlog("TG", f"Sending to {len(targets)} target(s): {targets[:3]}{'...' if len(targets) > 3 else ''}")
     for tid in targets:
         payload = json.dumps({"chat_id": tid, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}).encode()
         req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
         try:
             urllib.request.urlopen(req, timeout=15)
+            vlog("TG", f"OK to {tid}")
         except urllib.error.HTTPError as e:
+            vlog("TG", f"FAILED to {tid}: HTTP {e.code}")
             if chat_id == ADMIN_ID:
                 log(f"[TG] Admin notify failed: HTTP {e.code}")
         except Exception as e:
+            vlog("TG", f"ERROR to {tid}: {type(e).__name__}: {str(e)[:80]}")
             if chat_id == ADMIN_ID:
                 log(f"[TG] Admin notify error: {e}")
         time.sleep(0.05)
@@ -293,53 +358,101 @@ def tg_get_updates(offset=0):
 
 # ---- Kick API ----
 def kick_request(url, extra_headers=None, timeout=15, user_id=None):
+    vlog("KICK", f"kick_request: {url}")
     headers = dict(BASE_HEADERS)
     cookie = get_cookie(user_id)
     if cookie:
         headers["Cookie"] = "session=" + cookie
         headers["Authorization"] = f"Bearer {cookie}"
+        vlog("KICK", f"Cookie attached: {len(cookie)} chars")
+    else:
+        vlog("KICK", "WARNING: No cookie available!")
     headers["X-Client-Token"] = KICK_CLIENT_TOKEN
     if extra_headers: headers.update(extra_headers)
+    dbg_request("KICK", url, headers, "GET")
     req = urllib.request.Request(url)
     for k, v in headers.items(): req.add_header(k, v)
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)
-        return json.loads(resp.read().decode())
+        data = json.loads(resp.read().decode())
+        vlog("KICK", f"<<< HTTP 200 | Response keys: {list(data.keys())[:5] if isinstance(data, dict) else type(data).__name__}")
+        if isinstance(data, dict) and 'data' in data:
+            d = data['data']
+            if isinstance(d, list):
+                vlog("KICK", f"    data[]: {len(d)} items")
+            elif isinstance(d, dict):
+                vlog("KICK", f"    data{{}}: keys={list(d.keys())[:5]}")
+        return data
     except urllib.error.HTTPError as e:
+        body_snippet = ""
+        try:
+            body_snippet = e.read().decode()[:200]
+        except: pass
+        vlog("KICK", f"<<< HTTP {e.code} | Body: {body_snippet}")
+        raise
+    except Exception as e:
+        vlog("KICK", f"<<< ERROR: {type(e).__name__}: {str(e)[:100]}")
         raise
 
 def fetch_campaigns():
+    vlog("CAMPAIGNS", f"Fetching campaigns from {DROPS_API}")
     try:
         data = kick_request(DROPS_API)
-        return data.get("data", []), True
+        campaigns = data.get("data", [])
+        vlog("CAMPAIGNS", f"SUCCESS: {len(campaigns)} campaigns fetched")
+        for i, c in enumerate(campaigns[:5]):
+            name = c.get('name', '?')
+            status = c.get('status', '?')
+            ch_count = len(c.get('channels', []))
+            vlog("CAMPAIGNS", f"  [{i}] {name} | status={status} | channels={ch_count}")
+        return campaigns, True
     except urllib.error.HTTPError as e:
+        body = ""
+        try: body = e.read().decode()[:200]
+        except: pass
+        vlog("CAMPAIGNS", f"FAILED: HTTP {e.code} | Body: {body}")
         if e.code in (401, 403): return None, False
         return None, True
-    except: return None, True
+    except Exception as e:
+        vlog("CAMPAIGNS", f"FAILED: {type(e).__name__}: {str(e)[:100]}")
+        return None, True
 
 def get_channel_info(username):
+    vlog("CHANNEL", f"get_channel_info(@{username})")
     try:
-        data = kick_request(CHANNEL_API.format(username=username))
+        url = CHANNEL_API.format(username=username)
+        data = kick_request(url)
         livestream = data.get("livestream") or {}
-        return {
+        result = {
             "channel_id": data.get("id"),
             "livestream_id": livestream.get("id"),
             "username": data.get("slug", username),
             "is_live": bool(livestream.get("is_live")),
         }
-    except: return None
+        vlog("CHANNEL", f"@{username}: channel_id={result['channel_id']}, ls_id={result['livestream_id']}, is_live={result['is_live']}")
+        return result
+    except urllib.error.HTTPError as e:
+        vlog("CHANNEL", f"@{username}: HTTP {e.code}")
+        return None
+    except Exception as e:
+        vlog("CHANNEL", f"@{username}: ERROR {type(e).__name__}: {str(e)[:80]}")
+        return None
 
 def follow_channel(username):
     """Follow a channel on Kick - with 429 backoff.
     Uses browser-like headers including XSRF token for Kasada bypass."""
     global FOLLOW_COOLDOWN
+    vlog("FOLLOW", f"follow_channel(@{username}) called")
     if username in FOLLOW_COOLDOWN:
-        if time.time() < FOLLOW_COOLDOWN[username]:
+        remaining = FOLLOW_COOLDOWN[username] - time.time()
+        if remaining > 0:
+            vlog("FOLLOW", f"@{username}: In cooldown, {remaining:.0f}s left - SKIP")
             return False
     try:
         url = FOLLOW_API.format(channel_slug=username)
         cookie = get_cookie()
         decoded = get_session_token()
+        vlog("FOLLOW", f"@{username}: cookie={len(cookie)}chars, token={'YES' if decoded else 'NO'}")
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -382,19 +495,25 @@ _followed_cache = {"data": None, "ts": 0, "failed": False}
 def get_followed_streamers():
     global _followed_cache
     now = time.time()
+    vlog("FOLLOWED", f"get_followed_streamers() called")
     # If failed due to 401, don't retry for 30 minutes
     if _followed_cache["failed"] and now - _followed_cache["ts"] < 1800:
+        remaining = 1800 - (now - _followed_cache["ts"])
+        vlog("FOLLOWED", f"Cached (failed), {remaining:.0f}s until retry, returning {len(_followed_cache['data'] or [])} cached")
         return _followed_cache["data"] or []
     # Cache for 5 minutes
     if _followed_cache["data"] is not None and now - _followed_cache["ts"] < 300:
+        vlog("FOLLOWED", f"Cached (fresh), returning {len(_followed_cache['data'])} cached")
         return _followed_cache["data"]
     try:
         data = kick_request(FOLLOWED_API)
         channels = data.get("channels", [])
         result = [ch.get("channel_slug") or ch.get("user_username") for ch in channels if ch.get("channel_slug")]
         _followed_cache = {"data": result, "ts": now, "failed": False}
+        vlog("FOLLOWED", f"SUCCESS: {len(result)} followed channels: {result[:5]}")
         return result
     except urllib.error.HTTPError as e:
+        vlog("FOLLOWED", f"HTTP {e.code}")
         if e.code == 401:
             _followed_cache["failed"] = True
             _followed_cache["ts"] = now
@@ -403,6 +522,7 @@ def get_followed_streamers():
             log(f"[FOLLOWED] HTTP {e.code}")
         return _followed_cache["data"] or []
     except Exception as e:
+        vlog("FOLLOWED", f"ERROR: {type(e).__name__}: {str(e)[:80]}")
         log(f"[FOLLOWED] Error: {e}")
         return _followed_cache["data"] or []
 
@@ -435,14 +555,25 @@ def try_claim_in_chat(username):
     return None
 
 def get_ws_token(session_token):
+    vlog("WS", f"get_ws_token() called, token={'YES' if session_token else 'NO'}")
     try:
         data = kick_request(WS_TOKEN_API, extra_headers={
             "Authorization": f"Bearer {session_token}",
             "X-Client-Token": KICK_CLIENT_TOKEN,
             "Sec-Fetch-Site": "same-site",
         })
-        return data.get("data", {}).get("token")
-    except: return None
+        ws_token = data.get("data", {}).get("token")
+        if ws_token:
+            vlog("WS", f"SUCCESS: Got WS token ({len(ws_token)} chars)")
+        else:
+            vlog("WS", f"FAILED: No token in response. Keys: {list(data.keys())}")
+        return ws_token
+    except urllib.error.HTTPError as e:
+        vlog("WS", f"FAILED: HTTP {e.code}")
+        return None
+    except Exception as e:
+        vlog("WS", f"FAILED: {type(e).__name__}: {str(e)[:80]}")
+        return None
 
 def get_session_token(user_id=None):
     """Return decoded cookie as Bearer token"""
@@ -490,49 +621,68 @@ _progress_cache = {"data": None, "ts": 0}
 def fetch_progress(user_id=None):
     global _progress_cache
     now = time.time()
+    vlog("PROGRESS", f"fetch_progress(user={user_id}) called")
     # Cache for 5 seconds to avoid 403 rate limits
     cache_key = f"user_{user_id}" if user_id else "global"
     if _progress_cache["data"] is not None and now - _progress_cache["ts"] < 5:
+        vlog("PROGRESS", f"Cached ({now - _progress_cache['ts']:.1f}s old), returning {len(_progress_cache['data'] or [])} items")
         return _progress_cache["data"]
     try:
         cookie = get_cookie(user_id)
+        if not cookie:
+            vlog("PROGRESS", "FAILED: No cookie!")
+            return []
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + cookie
         headers["Authorization"] = f"Bearer {get_session_token()}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+        dbg_request("PROGRESS", PROGRESS_API, headers, "GET")
         req = urllib.request.Request(PROGRESS_API)
         for k, v in headers.items(): req.add_header(k, v)
         resp = urllib.request.urlopen(req, timeout=15)
         data = json.loads(resp.read().decode()).get("data", [])
+        vlog("PROGRESS", f"SUCCESS: {len(data)} progress items")
         _progress_cache = {"data": data, "ts": now}
         return data
     except urllib.error.HTTPError as e:
-        log(f"[PROGRESS] HTTP {e.code}: {e.read().decode()[:200] if e.fp else ''}")
+        resp_body = e.read().decode()[:200] if e.fp else ''
+        vlog("PROGRESS", f"HTTP {e.code}: {resp_body}")
+        log(f"[PROGRESS] HTTP {e.code}: {resp_body}")
         return _progress_cache["data"] or []
     except Exception as e:
+        vlog("PROGRESS", f"ERROR: {type(e).__name__}: {str(e)[:100]}")
         log(f"[PROGRESS] Error: {e}")
         return _progress_cache["data"] or []
 
 def claim_reward(campaign_id, reward_id, user_id=None):
+    vlog("CLAIM", f"claim_reward(campaign={campaign_id}, reward={reward_id}, user={user_id})")
     try:
         cookie = get_cookie(user_id)
+        if not cookie:
+            vlog("CLAIM", "FAILED: No cookie!")
+            return None
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + cookie
         headers["Authorization"] = f"Bearer {cookie}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
         headers["Content-Type"] = "application/json"
-        body = json.dumps({"campaign_id": campaign_id, "reward_id": reward_id}).encode()
-        req = urllib.request.Request(CLAIM_API, data=body, method="POST")
+        body = json.dumps({"campaign_id": campaign_id, "reward_id": reward_id})
+        vlog("CLAIM", f"Request body: {body}")
+        dbg_request("CLAIM", CLAIM_API, headers, "POST", body)
+        req = urllib.request.Request(CLAIM_API, data=body.encode(), method="POST")
         for k, v in headers.items(): req.add_header(k, v)
         resp = urllib.request.urlopen(req, timeout=15)
         result = json.loads(resp.read().decode())
+        vlog("CLAIM", f"<<< HTTP 200 | Result: {json.dumps(result, default=str)[:300]}")
         log(f"[CLAIM] OK: {result}")
         return result
     except urllib.error.HTTPError as e:
-        body = e.read().decode()[:300] if e.fp else ""
-        log(f"[CLAIM] HTTP {e.code}: {body}")
+        resp_body = e.read().decode()[:300] if e.fp else ""
+        vlog("CLAIM", f"<<< HTTP {e.code} | Body: {resp_body}")
+        log(f"[CLAIM] HTTP {e.code}: {resp_body}")
         return None
     except Exception as e:
+        vlog("CLAIM", f"ERROR: {type(e).__name__}: {str(e)[:100]}")
         log(f"[CLAIM] Error: {e}")
         return None
 
@@ -605,12 +755,15 @@ def smart_claim_check(username=None):
         return False
 
 async def send_user_event(ws, channel_id, livestream_id):
+    ls_id = int(livestream_id) if livestream_id else int(channel_id)
     event = {"type": "user_event", "data": {"message": {
         "name": "tracking.user.watch.livestream",
         "channel_id": channel_id,
-        "livestream_id": int(livestream_id) if livestream_id else int(channel_id),
+        "livestream_id": ls_id,
     }}}
+    vlog("WS-EVENT", f"Sending: channel={channel_id}, livestream={ls_id}")
     await ws.send(json.dumps(event))
+    vlog("WS-EVENT", "Sent OK")
 
 def fmt_duration(seconds):
     h = int(seconds) // 3600
@@ -1003,8 +1156,12 @@ class SingleStreamWatcher:
             self.parent.on_watcher_done(self.username)
 
     def _ws_connect(self):
+        vlog("WS-CONN", f"@{self.username}: Getting WS token...")
         ws_token = get_ws_token(get_cookie())
-        if not ws_token: raise Exception("No WS token")
+        if not ws_token:
+            vlog("WS-CONN", f"@{self.username}: No WS token! Raising exception.")
+            raise Exception("No WS token")
+        vlog("WS-CONN", f"@{self.username}: Got WS token ({len(ws_token)} chars)")
         ws_url = WS_URL_TEMPLATE.format(token=ws_token)
         headers = dict(BASE_HEADERS)
         loop = asyncio.new_event_loop()
@@ -1016,13 +1173,17 @@ class SingleStreamWatcher:
         username = self.username
         channel_id = self.channel_id
         livestream_id = self.livestream_id
+        vlog("WATCH-WS", f"@{username}: Connecting... ch={channel_id}, ls={livestream_id}")
         async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+            vlog("WATCH-WS", f"@{username}: Connected! Sending handshake...")
             await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
             try: await asyncio.wait_for(ws.recv(), timeout=5)
-            except: pass
+            except: vlog("WATCH-WS", f"@{username}: Handshake recv timeout (normal)")
+            vlog("WATCH-WS", f"@{username}: Sending initial user_event...")
             await send_user_event(ws, channel_id, livestream_id)
             with self._lock: self.events_sent += 1
             log(f"[WATCH] Connected @{username} channel_id={channel_id} livestream_id={livestream_id}")
+            vlog("WATCH-WS", f"@{username}: Initial event sent, entering loop")
             last_ue = time.time()
             last_ping = time.time()
             last_alive = time.time()
@@ -1335,6 +1496,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"<h1>401 Unauthorized</h1><p>Admin access only.</p>")
 
     def do_GET(self):
+        # /health - NO AUTH REQUIRED (for Render keepalive)
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+            return
+        
         if not self._check_auth():
             self._send_auth_required()
             return
@@ -1427,6 +1596,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 # ---- Commands ----
 def handle_command(cmd, chat_id, text="", username=None, first_name=None):
+    vlog("CMD", f"Command: {cmd} | chat_id={chat_id} | user=@{username or '?'} | text='{text[:50]}'")
     is_new = add_sub(chat_id, username=username, first_name=first_name)
 
     if cmd in ("/start", "/help"):
@@ -1552,27 +1722,34 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
     elif cmd == "/setcookie":
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
+            vlog("CMD", f"/setcookie: No cookie provided by user {chat_id}")
             tg_send("Usage: /setcookie &lt;cookie&gt;\n\nKick se cookie paste karo.\nBot validate karega aur tumhara username fetch karega.", chat_id=chat_id)
             return
         
         raw_cookie = parts[1].strip()
+        vlog("CMD", f"/setcookie: Raw cookie length={len(raw_cookie)}, first20='{raw_cookie[:20]}...'")
         # Always decode cookie (if URL-encoded %7C → |)
         try:
             import urllib.parse
             cookie = urllib.parse.unquote(raw_cookie)
+            vlog("CMD", f"/setcookie: Decoded length={len(cookie)}")
         except:
             cookie = raw_cookie
         tg_send("Validating cookie...", chat_id=chat_id)
         
         # Validate cookie and get user info
+        vlog("CMD", f"/setcookie: Validating cookie...")
         valid, username, user_id = validate_cookie_and_get_user(cookie)
+        vlog("CMD", f"/setcookie: Validation result: valid={valid}, username={username}, user_id={user_id}")
         
         if valid:
             # Save per-user cookie
+            vlog("CMD", f"/setcookie: Saving to Supabase for user {chat_id}")
             if USE_SUPABASE:
                 db.save_user_cookie(chat_id, cookie, username or "unknown", user_id or 0)
             
             # Also save as global fallback
+            vlog("CMD", f"/setcookie: Saving as global fallback")
             save_cookie(cookie)
             
             msg = (f"<b>Cookie Saved!</b>\n\n"
@@ -1585,16 +1762,21 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             tg_send_admin(f"<b>NEW COOKIE SET!</b>\nFollowed: {username}\nTG: {chat_id}")
         else:
             # Invalid cookie - save as global fallback
+            vlog("CMD", f"/setcookie: INVALID cookie - saving as fallback anyway")
             save_cookie(cookie)
             tg_send("Cookie saved (validation failed - using as global fallback).\nAgar yeh cookie valid hai toh baad mein kaam karegi.", chat_id=chat_id)
 
     elif cmd == "/checkcookie":
         global COOKIE_VALIDATED
+        vlog("CMD", f"/checkcookie: Checking cookie for user {chat_id}")
         cookie = get_cookie()
         if not cookie:
+            vlog("CMD", f"/checkcookie: No cookie found!")
             tg_send("<b>🔴 No cookie found!</b>\nUse /setcookie to add one.", chat_id=chat_id)
             return
+        vlog("CMD", f"/checkcookie: Cookie found: {len(cookie)} chars")
         valid, username, user_id = validate_cookie_and_get_user(cookie)
+        vlog("CMD", f"/checkcookie: Result: valid={valid}, username={username}, user_id={user_id}")
         if valid:
             COOKIE_VALIDATED = True
             tg_send(f"<b>✅ Cookie VALID!</b>\n\n<b>Kick User:</b> @{username}\n<b>User ID:</b> {user_id}\n<b>Cookie length:</b> {len(cookie)} chars", chat_id=chat_id)
@@ -2014,6 +2196,7 @@ class DropHunter:
         # Step 3: Continuous polling loop - ALWAYS POLL for notifications
         # Watching (WS connections) only during active hours
         was_active = self._is_active_hours()
+        consecutive_errors = 0
         while self.active:
             try:
                 is_now_active = self._is_active_hours()
@@ -2036,27 +2219,42 @@ class DropHunter:
                 
                 # ALWAYS poll for drops, notifications, claims (24/7)
                 self._poll_and_watch()
+                consecutive_errors = 0  # Reset on success
             except Exception as e:
+                consecutive_errors += 1
+                vlog("DH", f"Loop error #{consecutive_errors}: {type(e).__name__}: {str(e)[:100]}")
                 log(f"[DH] Error: {e}")
+                if consecutive_errors > 10:
+                    log(f"[DH] Too many errors ({consecutive_errors}), waiting 30s before retry")
+                    time.sleep(30)
+                    consecutive_errors = 0
+                else:
+                    time.sleep(2)  # Brief pause on error
             time.sleep(POLL_INTERVAL)  # 5s always — 24/7 polling
     
     def _discover_all_channels(self):
         """Discover ALL channels from campaigns + watchlist + user preferences."""
+        vlog("DH-DISCOVER", "Starting channel discovery...")
         try:
             # Source 1: From API (current campaigns)
-            campaigns, _ = fetch_campaigns()
+            vlog("DH-DISCOVER", "Source 1: Fetching campaigns...")
+            campaigns, cookie_ok = fetch_campaigns()
             if campaigns:
                 for c in campaigns:
                     for ch in c.get("channels", []):
                         slug = ch.get("slug") or (ch.get("user") or {}).get("username", "")
                         if slug and slug not in self.known_all_channels:
                             self.known_all_channels.add(slug)
+                vlog("DH-DISCOVER", f"From campaigns: {len(self.known_all_channels)} channels so far")
+            else:
+                vlog("DH-DISCOVER", f"No campaigns (cookie_ok={cookie_ok})")
             
             # Source 2: From persistent watchlist (manual)
             watchlist = get_watchlist()
             for slug in watchlist:
                 if slug not in self.known_all_channels:
                     self.known_all_channels.add(slug)
+            vlog("DH-DISCOVER", f"From watchlist: {len(watchlist)} channels")
             
             # Source 3: From followed channels
             try:
@@ -2064,7 +2262,9 @@ class DropHunter:
                 for slug in followed:
                     if slug not in self.known_all_channels:
                         self.known_all_channels.add(slug)
-            except: pass
+                vlog("DH-DISCOVER", f"From followed: {len(followed)} channels")
+            except Exception as e:
+                vlog("DH-DISCOVER", f"Followed error: {e}")
             
             # Source 4: From user preferences (custom streamers)
             self.user_pref_channels = set()
@@ -2080,9 +2280,11 @@ class DropHunter:
                 except Exception as e:
                     log(f"[DH] User prefs load error: {e}")
             
+            vlog("DH-DISCOVER", f"FINAL: {len(self.known_all_channels)} total channels (watchlist={len(watchlist)}, user_prefs={len(self.user_pref_channels)})")
             log(f"[DH] Total known: {len(self.known_all_channels)} (watchlist: {len(watchlist)}, user_prefs: {len(self.user_pref_channels)})")
             
         except Exception as e:
+            vlog("DH-DISCOVER", f"ERROR: {type(e).__name__}: {str(e)[:100]}")
             log(f"[DH] Discover error: {e}")
     
     def _start_watching_all_known(self):
@@ -2110,16 +2312,21 @@ class DropHunter:
         - is_manual: No time limit
         - is_user_pref: No limit (until stopped/offline)
         - Default: 30 min limit, only during active hours (4AM-10AM IST)"""
-        if slug in self.watching_channels: return
+        vlog("DH", f"_start_watching_channel(@{slug}, manual={is_manual}, pref={is_user_pref})")
+        if slug in self.watching_channels:
+            vlog("DH", f"@{slug} already watching - SKIP")
+            return
         
         # Get channel info
         info = get_channel_info(slug)
         if not info or not info.get("is_live"):
+            vlog("DH", f"@{slug} offline or not found - SKIP")
             log(f"[DH] @{slug} offline, will retry when live")
             return
         
         cid = channel_id or info.get("channel_id")
         lsid = info.get("livestream_id")
+        vlog("DH", f"@{slug}: channel_id={cid}, livestream_id={lsid}")
         
         stop_event = threading.Event()
         
@@ -2150,11 +2357,13 @@ class DropHunter:
         - User preferences: No limit (until stopped/offline)
         - Manual: No limit"""
         start_time = time.time()
+        vlog("DH-WATCH", f"@{slug}: Watch loop started (manual={is_manual}, pref={is_user_pref})")
         
         while not stop_event.is_set():
             # Check time limit (only for Stake list)
             elapsed = time.time() - start_time
             if not is_manual and not is_user_pref and elapsed >= AUTO_WATCH_LIMIT:
+                vlog("DH-WATCH", f"@{slug}: 30min limit reached")
                 log(f"[DH] @{slug} 30min limit reached, stopping")
                 break
             
@@ -2163,17 +2372,21 @@ class DropHunter:
                 try:
                     info = get_channel_info(slug)
                     if not info or not info.get("is_live"):
+                        vlog("DH-WATCH", f"@{slug}: Offline - stopping")
                         log(f"[DH] @{slug} offline - stopping user preference watch")
                         break
                 except: pass
             
             try:
+                vlog("DH-WATCH", f"@{slug}: Getting WS token...")
                 ws_token = get_ws_token(get_cookie())
                 if not ws_token:
+                    vlog("DH-WATCH", f"@{slug}: No WS token - retrying in 10s")
                     time.sleep(10)
                     continue
                 
                 ws_url = WS_URL_TEMPLATE.format(token=ws_token)
+                vlog("DH-WATCH", f"@{slug}: WS URL ready, connecting...")
                 headers = dict(BASE_HEADERS)
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -2182,6 +2395,7 @@ class DropHunter:
                 finally:
                     loop.close()
             except Exception as e:
+                vlog("DH-WATCH", f"@{slug}: ERROR {type(e).__name__}: {str(e)[:100]}")
                 log(f"[DH] WS error @{slug}: {e}")
             
             if not stop_event.is_set():
@@ -2192,16 +2406,20 @@ class DropHunter:
         import websockets
         
         ls_id = livestream_id or channel_id
+        vlog("DH-WS", f"@{slug}: Connecting WS... channel={channel_id}, ls={ls_id}")
         
         async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+            vlog("DH-WS", f"@{slug}: WS connected! Sending handshake...")
             # Handshake
             await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
             try: await asyncio.wait_for(ws.recv(), timeout=5)
-            except asyncio.TimeoutError: pass
+            except asyncio.TimeoutError: vlog("DH-WS", f"@{slug}: Handshake recv timeout (normal)")
             except Exception as e: log(f"[DH] Handshake recv error @{slug}: {e}")
             
             # Initial user_event
+            vlog("DH-WS", f"@{slug}: Sending initial user_event...")
             await send_user_event(ws, channel_id, ls_id)
+            vlog("DH-WS", f"@{slug}: Initial event sent OK")
             
             last_ue = time.time()
             last_ping = time.time()
@@ -2267,11 +2485,15 @@ class DropHunter:
     def _poll_and_watch(self):
         """Check campaigns, detect drops, send notifications, claim rewards.
         Always runs 24/7 for notifications. WS watching gated by active hours."""
-        # Log watching status every minute
+        vlog("POLL", f"--- Poll cycle #{self.state.get('polls', 0) + 1} ---")
         self._log_watching_status()
         
         campaigns, cookie_ok = fetch_campaigns()
-        if not campaigns: return
+        if not campaigns:
+            vlog("POLL", f"No campaigns. cookie_ok={cookie_ok}")
+            if cookie_ok is False:
+                log("[DH] Campaigns fetch failed - cookie invalid (401/403)")
+            return
         
         # Safety: ensure campaigns is a list of dicts
         if not isinstance(campaigns, list):
@@ -2501,30 +2723,56 @@ drop_hunter = DropHunter()
 
 def poller():
     """Legacy poller - now just starts DropHunter"""
+    vlog("POLLER", "Starting DropHunter...")
     drop_hunter.start()
+    vlog("POLLER", "DropHunter started. Entering keepalive loop.")
     while True:
         time.sleep(60)
 
 # ---- Main ----
+def _self_ping():
+    """Self-ping every 4 minutes to keep Render free instance alive."""
+    import urllib.request as _req
+    while True:
+        time.sleep(240)  # Every 4 minutes
+        try:
+            url = f"http://127.0.0.1:{DASHBOARD_PORT}/health"
+            _req.urlopen(url, timeout=10)
+            vlog("KEEPALIVE", f"Self-ping OK ({url})")
+        except Exception as e:
+            vlog("KEEPALIVE", f"Self-ping failed: {e}")
+
 def main():
     global COOKIE_VALIDATED
     log("=" * 50)
-    log("KICK STAKE DROPS BOT v25 - TIME WINDOW + TEST MODE")
+    log("KICK STAKE DROPS BOT v25 - HEAVY DEBUG MODE")
     log("=" * 50)
+    vlog("STARTUP", f"VERBOSE_DEBUG={VERBOSE_DEBUG}")
+    vlog("STARTUP", f"USE_SUPABASE={USE_SUPABASE}")
+    vlog("STARTUP", f"INITIAL_COOKIE length={len(INITIAL_COOKIE)} chars")
+    vlog("STARTUP", f"KICK_CLIENT_TOKEN length={len(KICK_CLIENT_TOKEN)} chars")
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
     log(f"Dashboard: port {DASHBOARD_PORT} (user: {DASH_USER})")
     
+    # Self-ping thread: keeps Render free instance alive
+    threading.Thread(target=_self_ping, daemon=True).start()
+    vlog("STARTUP", "Self-ping thread started (every 4 min)")
+    
     # Validate cookie on startup
+    vlog("STARTUP", "--- Cookie Validation ---")
     cookie = get_cookie()
     if cookie:
+        vlog("STARTUP", f"Cookie found: {len(cookie)} chars, first10='{cookie[:10]}...'")
         try:
             headers = dict(BASE_HEADERS)
             headers["Cookie"] = "session=" + cookie
             headers["Authorization"] = f"Bearer {cookie}"
             headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+            dbg_request("STARTUP", "https://kick.com/api/v2/users/me", headers, "GET")
             req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
             resp = urllib.request.urlopen(req, timeout=10)
             data = json.loads(resp.read().decode())
+            vlog("STARTUP", f"Response: {json.dumps(data, default=str)[:300]}")
             if data.get("username"):
                 COOKIE_VALIDATED = True
                 log(f"[STARTUP] Cookie VALID - @{data['username']}")
@@ -2532,6 +2780,10 @@ def main():
                 COOKIE_VALIDATED = True
                 log("[STARTUP] Cookie check - no username but no error")
         except urllib.error.HTTPError as e:
+            resp_body = ""
+            try: resp_body = e.read().decode()[:200]
+            except: pass
+            vlog("STARTUP", f"HTTP {e.code} | Body: {resp_body}")
             if e.code == 401:
                 COOKIE_VALIDATED = False
                 log("[STARTUP] Cookie EXPIRED! Use /setcookie to update.")
@@ -2540,9 +2792,11 @@ def main():
                 log(f"[STARTUP] Cookie check: HTTP {e.code} (not cookie issue)")
         except Exception as e:
             COOKIE_VALIDATED = True
+            vlog("STARTUP", f"Exception: {type(e).__name__}: {str(e)[:100]}")
             log(f"[STARTUP] Cookie check error: {str(e)[:50]} (assuming valid)")
     else:
         COOKIE_VALIDATED = False
+        vlog("STARTUP", "NO COOKIE FOUND!")
         log("[STARTUP] No cookie found! Use /setcookie to add one.")
     
     threading.Thread(target=poller, daemon=True).start()
@@ -2553,28 +2807,44 @@ def main():
     try:
         campaigns, _ = fetch_campaigns()
         if campaigns:
+            vlog("STARTUP", f"Following {len(campaigns)} campaign streamers on startup")
             follow_drop_streamers(campaigns)
-    except: pass
+    except Exception as e:
+        vlog("STARTUP", f"Startup follow error: {e}")
     
-    status = "✅ Cookie OK" if COOKIE_VALIDATED else "🔴 Cookie INVALID"
-    tg_send_admin(f"<b>Bot v24 Started!</b>\n\nCookie: {status}\nDrop Hunter: active\nActive Hours: 4 AM - 10 AM IST\nManual: /watchtest works 24/7")
-    log("Listening...")
+    status = "Cookie OK" if COOKIE_VALIDATED else "Cookie INVALID"
+    tg_send_admin(f"<b>Bot v25 Started!</b>\n\nCookie: {status}\nTLS: DEBUG MODE\nDrop Hunter: active\nActive Hours: 2 AM - 11 AM IST\nManual: /watchtest works 24/7")
+    vlog("STARTUP", "--- Bot started, entering main loop ---")
+    log("Listening... (24/7 mode - never stops!)")
     offset = 0
     while True:
-        for u in tg_get_updates(offset):
-            offset = u["update_id"] + 1
-            msg = u.get("message", {})
-            cid = msg.get("chat", {}).get("id")
-            text = msg.get("text", "")
-            # Extract Telegram username and name
-            from_user = msg.get("from", {})
-            tg_username = from_user.get("username", "")
-            tg_first_name = from_user.get("first_name", "")
-            if text.startswith("/"):
-                log(f"CMD: {text} from @{tg_username or cid}")
-                handle_command(text.split()[0].lower(), cid, text, username=tg_username, first_name=tg_first_name)
+        try:
+            for u in tg_get_updates(offset):
+                offset = u["update_id"] + 1
+                msg = u.get("message", {})
+                cid = msg.get("chat", {}).get("id")
+                text = msg.get("text", "")
+                # Extract Telegram username and name
+                from_user = msg.get("from", {})
+                tg_username = from_user.get("username", "")
+                tg_first_name = from_user.get("first_name", "")
+                if text.startswith("/"):
+                    log(f"CMD: {text} from @{tg_username or cid}")
+                    handle_command(text.split()[0].lower(), cid, text, username=tg_username, first_name=tg_first_name)
+        except Exception as e:
+            vlog("MAIN", f"Main loop error: {type(e).__name__}: {str(e)[:100]}")
+            log(f"[MAIN] Loop error: {str(e)[:80]} - continuing...")
+            time.sleep(5)  # Wait 5s before retry
         time.sleep(1)
 
 if __name__ == "__main__":
-    try: main()
-    except KeyboardInterrupt: log("Stopped")
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("Stopped by user")
+    except Exception as e:
+        log(f"FATAL: {type(e).__name__}: {str(e)[:200]}")
+        # Try to notify admin before dying
+        try:
+            tg_send_admin(f"<b>🔴 BOT CRASHED!</b>\n{type(e).__name__}: {str(e)[:200]}")
+        except: pass
