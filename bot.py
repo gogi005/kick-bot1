@@ -115,7 +115,8 @@ def get_tls_session():
             client_identifier="chrome_120",
             random_tls_extension_order=True
         )
-        _tls_session.headers.update(BROWSER_HEADERS)
+        # Use API headers (JSON accept), NOT BROWSER_HEADERS (navigation headers)
+        _tls_session.headers.update(BASE_HEADERS)
         return _tls_session
     except Exception as e:
         print(f"[TLS] Session error: {e}")
