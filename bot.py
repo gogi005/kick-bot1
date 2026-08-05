@@ -1509,6 +1509,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         known = state.get("known", {})
         subs = load_subs()
         active = sum(1 for s in subs.values() if s.get("active", True))
+        # Get poll count from DropHunter's in-memory state (more accurate)
+        poll_count = drop_hunter.state.get('polls', 0)
+        last_poll = drop_hunter.state.get('last_poll', None)
         rows = ""
         for sid, d in subs.items():
             st = "Active" if d.get("active", True) else "Inactive"
@@ -1552,7 +1555,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 <style>body{{font-family:Arial;background:#1a1a2e;color:#eee;padding:20px}}h1{{color:#e94560}}.c{{background:#16213e;padding:20px;border-radius:10px;margin:10px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;text-align:left;border-bottom:1px solid #333}}th{{background:#0f3460}}a{{color:#e94560}}</style></head><body>
 <h1>Kick Stake Drops Bot v25 - Test Mode + Logs</h1>
 <p><a href="/logs">View Logs</a></p>
-<div class="c"><h2>Status</h2><p>Polls: {state.get('polls',0)}</p><p>Last: {state.get('last_poll','never')}</p></div>
+<div class="c"><h2>Status</h2><p>Polls: {poll_count}</p><p>Last: {last_poll[:19] if last_poll else 'never'}</p></div>
 <div class="c"><h2>Drop Hunter v3 (Always-On)</h2><p style='color:{dh_c};font-size:1.2em'><b>{dh_s}</b></p><p>Watching: {dh_watching} channels</p><p>Known: {dh_known} channels</p><p>Claimed: {dh_claimed}</p><p>Pending retries: {dh_retries}</p></div>
 {user_cookies_html}
 <div class="c"><h2>Parallel Watcher</h2><p style='color:{pw_c};font-size:1.2em'><b>{pw_s}</b></p><p>Watching: {w_list}</p><p>Watched: {pw.state.get('total_watched',0)}</p><p>Claimed: {pw.state.get('rewards_claimed',0)}</p></div>
@@ -1710,7 +1713,8 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         for i in range(0, len(msg), 4000): tg_send(msg[i:i+4000], chat_id=chat_id)
 
     elif cmd == "/status":
-        tg_send(f"Polls: {load_state().get('polls',0)}\nDrops: {len(load_state().get('known',{}))}\nSubs: {len(get_active_subs())}\nPW: {'ON' if pw.active else 'OFF'}\nSW: {'ON' if single_watcher.active else 'OFF'}", chat_id=chat_id)
+        polls = drop_hunter.state.get('polls', 0)
+        tg_send(f"Polls: {polls}\nDrops: {len(drop_hunter.known_campaigns)}\nWatching: {len(drop_hunter.watching_channels)}\nSubs: {len(get_active_subs())}\nDH: {'ON' if drop_hunter.active else 'OFF'}\nPW: {'ON' if pw.active else 'OFF'}\nSW: {'ON' if single_watcher.active else 'OFF'}", chat_id=chat_id)
 
     elif cmd == "/setcookie":
         parts = text.split(maxsplit=1)
@@ -2751,82 +2755,86 @@ def _self_ping():
 
 def main():
     global COOKIE_VALIDATED
+    log("[INIT] Bot main() starting...")
     log("=" * 50)
     log("KICK STAKE DROPS BOT v25 - HEAVY DEBUG MODE")
     log("=" * 50)
-    vlog("STARTUP", f"VERBOSE_DEBUG={VERBOSE_DEBUG}")
-    vlog("STARTUP", f"USE_SUPABASE={USE_SUPABASE}")
-    vlog("STARTUP", f"INITIAL_COOKIE length={len(INITIAL_COOKIE)} chars")
-    vlog("STARTUP", f"KICK_CLIENT_TOKEN length={len(KICK_CLIENT_TOKEN)} chars")
+    log(f"STARTUP: VERBOSE_DEBUG={VERBOSE_DEBUG}")
+    log(f"STARTUP: USE_SUPABASE={USE_SUPABASE}")
+    log(f"STARTUP: Cookie env length={len(INITIAL_COOKIE)} chars")
+    log(f"STARTUP: Client token length={len(KICK_CLIENT_TOKEN)} chars")
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
-    log(f"Dashboard: port {DASHBOARD_PORT} (user: {DASH_USER})")
+    log(f"STARTUP: Dashboard port {DASHBOARD_PORT}")
     
     # Self-ping thread: keeps Render free instance alive
     threading.Thread(target=_self_ping, daemon=True).start()
     vlog("STARTUP", "Self-ping thread started (every 4 min)")
     
-    # Validate cookie on startup
-    vlog("STARTUP", "--- Cookie Validation ---")
+    # Validate cookie on startup (with timeout protection)
+    log("STARTUP: Validating cookie...")
     cookie = get_cookie()
     if cookie:
-        vlog("STARTUP", f"Cookie found: {len(cookie)} chars, first10='{cookie[:10]}...'")
+        log(f"STARTUP: Cookie found: {len(cookie)} chars")
         try:
             headers = dict(BASE_HEADERS)
             headers["Cookie"] = "session=" + cookie
             headers["Authorization"] = f"Bearer {cookie}"
             headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-            dbg_request("STARTUP", "https://kick.com/api/v2/users/me", headers, "GET")
             req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
-            resp = urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=8)
             data = json.loads(resp.read().decode())
-            vlog("STARTUP", f"Response: {json.dumps(data, default=str)[:300]}")
             if data.get("username"):
                 COOKIE_VALIDATED = True
-                log(f"[STARTUP] Cookie VALID - @{data['username']}")
+                log(f"STARTUP: Cookie VALID - @{data['username']}")
             else:
                 COOKIE_VALIDATED = True
-                log("[STARTUP] Cookie check - no username but no error")
+                log("STARTUP: Cookie OK (no username in response)")
         except urllib.error.HTTPError as e:
-            resp_body = ""
-            try: resp_body = e.read().decode()[:200]
-            except: pass
-            vlog("STARTUP", f"HTTP {e.code} | Body: {resp_body}")
             if e.code == 401:
                 COOKIE_VALIDATED = False
-                log("[STARTUP] Cookie EXPIRED! Use /setcookie to update.")
+                log("STARTUP: Cookie EXPIRED (401)! Use /setcookie")
             else:
                 COOKIE_VALIDATED = True
-                log(f"[STARTUP] Cookie check: HTTP {e.code} (not cookie issue)")
+                log(f"STARTUP: Cookie check HTTP {e.code} (assuming valid)")
         except Exception as e:
             COOKIE_VALIDATED = True
-            vlog("STARTUP", f"Exception: {type(e).__name__}: {str(e)[:100]}")
-            log(f"[STARTUP] Cookie check error: {str(e)[:50]} (assuming valid)")
+            log(f"STARTUP: Cookie check error: {type(e).__name__} (assuming valid)")
     else:
         COOKIE_VALIDATED = False
-        vlog("STARTUP", "NO COOKIE FOUND!")
-        log("[STARTUP] No cookie found! Use /setcookie to add one.")
+        log("STARTUP: No cookie found! Use /setcookie to add one.")
     
+    # Start poller (DropHunter) and session keeper
+    log("STARTUP: Starting DropHunter...")
     threading.Thread(target=poller, daemon=True).start()
     try:
         threading.Thread(target=session_keeper, daemon=True).start()
+        log("STARTUP: Session keeper started")
     except: pass
-    # Follow yesterday's drop streamers on startup
+    
+    # Follow drop streamers on startup (with timeout protection)
     try:
-        campaigns, _ = fetch_campaigns()
+        log("STARTUP: Fetching campaigns to follow streamers...")
+        campaigns, ok = fetch_campaigns()
         if campaigns:
-            vlog("STARTUP", f"Following {len(campaigns)} campaign streamers on startup")
+            log(f"STARTUP: Found {len(campaigns)} campaigns, following streamers...")
             follow_drop_streamers(campaigns)
+            log("STARTUP: Done following streamers")
+        else:
+            log(f"STARTUP: No campaigns (ok={ok})")
     except Exception as e:
-        vlog("STARTUP", f"Startup follow error: {e}")
+        log(f"STARTUP: Follow error: {type(e).__name__}: {str(e)[:50]}")
     
     status = "Cookie OK" if COOKIE_VALIDATED else "Cookie INVALID"
-    tg_send_admin(f"<b>Bot v25 Started!</b>\n\nCookie: {status}\nTLS: DEBUG MODE\nDrop Hunter: active\nActive Hours: 2 AM - 11 AM IST\nManual: /watchtest works 24/7")
-    vlog("STARTUP", "--- Bot started, entering main loop ---")
-    log("Listening... (24/7 mode - never stops!)")
+    log(f"STARTUP: {status} - Bot ready!")
+    tg_send_admin(f"<b>Bot v25 Started!</b>\n\nCookie: {status}\nDrop Hunter: active\nActive Hours: 2 AM - 11 AM IST")
+    log("STARTUP: Listening for Telegram commands...")
     offset = 0
     while True:
         try:
-            for u in tg_get_updates(offset):
+            updates = tg_get_updates(offset)
+            if updates:
+                log(f"MAIN: Got {len(updates)} Telegram updates")
+            for u in updates:
                 offset = u["update_id"] + 1
                 msg = u.get("message", {})
                 cid = msg.get("chat", {}).get("id")
