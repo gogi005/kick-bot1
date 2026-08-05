@@ -2042,6 +2042,7 @@ class DropHunter:
         self.claim_retry_queue = {}  # claim_key -> {campaign_id, reward_id, slug, retries, next_retry, last_progress}
         self.failed_rewards = set()  # permanently failed - don't re-add to retry queue
         self.known_stake_campaigns = set()  # IDs of confirmed Stake drops only
+        self.state = {"polls": 0, "last_poll": None}
         self._lock = threading.Lock()
     
     def start(self):
