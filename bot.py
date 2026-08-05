@@ -127,8 +127,8 @@ def _save_logs():
     global _LOG_SAVE_TIMER
     try:
         now = time.time()
-        if USE_SUPABASE and now - _LOG_SAVE_TIMER < 10:
-            return  # Debounce: save every 10s for real-time dashboard
+        if USE_SUPABASE and now - _LOG_SAVE_TIMER < 30:
+            return  # Debounce: skip if saved recently
         _LOG_SAVE_TIMER = now
         with LOG_LOCK:
             logs_data = list(LOG_BUFFER[-200:])
@@ -384,31 +384,16 @@ def kick_request(url, extra_headers=None, timeout=15, user_id=None):
                 vlog("KICK", f"    data{{}}: keys={list(d.keys())[:5]}")
         return data
     except urllib.error.HTTPError as e:
-        body_snippet = ""
-        try:
-            body_snippet = e.read().decode()[:200]
-        except: pass
-        log(f"[KICK] HTTP {e.code} | {url.split('/')[-1][:30]} | {body_snippet[:80]}")
-        raise
-    except Exception as e:
-        log(f"[KICK] ERROR: {type(e).__name__}: {str(e)[:80]}")
         raise
 
 def fetch_campaigns():
     try:
         data = kick_request(DROPS_API)
-        campaigns = data.get("data", [])
-        return campaigns, True
+        return data.get("data", []), True
     except urllib.error.HTTPError as e:
-        body = ""
-        try: body = e.read().decode()[:200]
-        except: pass
-        log(f"[CAMPAIGNS] HTTP {e.code}: {body[:100]}")
         if e.code in (401, 403): return None, False
         return None, True
-    except Exception as e:
-        log(f"[CAMPAIGNS] ERROR: {type(e).__name__}: {str(e)[:100]}")
-        return None, True
+    except: return None, True
 
 def get_channel_info(username):
     vlog("CHANNEL", f"get_channel_info(@{username})")
@@ -2219,9 +2204,7 @@ class DropHunter:
                 consecutive_errors = 0  # Reset on success
             except Exception as e:
                 consecutive_errors += 1
-                tb = traceback.format_exc()[-200:]  # Last 200 chars of traceback
-                log(f"[DH] ERROR #{consecutive_errors}: {type(e).__name__}: {str(e)[:100]}")
-                log(f"[DH] TRACEBACK: {tb}")
+                log(f"[DH] Error #{consecutive_errors}: {type(e).__name__}: {str(e)[:100]}")
                 if consecutive_errors > 10:
                     log(f"[DH] Too many errors ({consecutive_errors}), waiting 30s before retry")
                     time.sleep(30)
@@ -2484,32 +2467,24 @@ class DropHunter:
         # Increment polls counter
         with self._lock:
             self.state["polls"] = self.state.get("polls", 0) + 1
-            poll_count = self.state["polls"]
             self.state["last_poll"] = datetime.now().isoformat()
         
-        # Heartbeat log every poll (visible in dashboard)
+        # Log watching status periodically
         watching_count = len(self.watching_channels)
-        if poll_count % 6 == 0:  # Log watching status every 30s (not every 5s)
-            self._log_watching_status()
-        else:
-            # Compact poll log every 5s
-            log(f"[DH] Poll #{poll_count} | Watching: {watching_count} | Checking drops...")
+        self._log_watching_status()
         
         campaigns, cookie_ok = fetch_campaigns()
         if not campaigns:
             if cookie_ok is False:
-                log(f"[DH] Poll #{poll_count} FAILED: Cookie invalid (401/403) - cannot fetch campaigns!")
+                log("[DH] Campaigns fetch failed - cookie invalid (401/403)")
             else:
-                log(f"[DH] Poll #{poll_count}: No campaigns found (API empty or blocked)")
+                log("[DH] No campaigns found (API empty or blocked)")
             return
         
         # Safety: ensure campaigns is a list of dicts
         if not isinstance(campaigns, list):
-            log(f"[DH] Poll #{poll_count} ERROR: Unexpected campaigns type: {type(campaigns)}")
+            log(f"[DH] Unexpected campaigns type: {type(campaigns)}")
             return
-        
-        # Log poll summary
-        log(f"[DH] Poll #{poll_count} OK: {len(campaigns)} campaigns | Watching: {watching_count}")
         
         for c in campaigns:
             if not self.active: break
@@ -2755,86 +2730,65 @@ def _self_ping():
 
 def main():
     global COOKIE_VALIDATED
-    log("[INIT] Bot main() starting...")
     log("=" * 50)
     log("KICK STAKE DROPS BOT v25 - HEAVY DEBUG MODE")
     log("=" * 50)
-    log(f"STARTUP: VERBOSE_DEBUG={VERBOSE_DEBUG}")
-    log(f"STARTUP: USE_SUPABASE={USE_SUPABASE}")
-    log(f"STARTUP: Cookie env length={len(INITIAL_COOKIE)} chars")
-    log(f"STARTUP: Client token length={len(KICK_CLIENT_TOKEN)} chars")
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
-    log(f"STARTUP: Dashboard port {DASHBOARD_PORT}")
+    log(f"Dashboard: port {DASHBOARD_PORT}")
     
     # Self-ping thread: keeps Render free instance alive
     threading.Thread(target=_self_ping, daemon=True).start()
     vlog("STARTUP", "Self-ping thread started (every 4 min)")
     
-    # Validate cookie on startup (with timeout protection)
-    log("STARTUP: Validating cookie...")
+    # Validate cookie on startup
     cookie = get_cookie()
     if cookie:
-        log(f"STARTUP: Cookie found: {len(cookie)} chars")
         try:
             headers = dict(BASE_HEADERS)
             headers["Cookie"] = "session=" + cookie
             headers["Authorization"] = f"Bearer {cookie}"
             headers["X-Client-Token"] = KICK_CLIENT_TOKEN
             req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
-            resp = urllib.request.urlopen(req, timeout=8)
+            resp = urllib.request.urlopen(req, timeout=10)
             data = json.loads(resp.read().decode())
             if data.get("username"):
                 COOKIE_VALIDATED = True
-                log(f"STARTUP: Cookie VALID - @{data['username']}")
+                log(f"[STARTUP] Cookie VALID - @{data['username']}")
             else:
                 COOKIE_VALIDATED = True
-                log("STARTUP: Cookie OK (no username in response)")
+                log("[STARTUP] Cookie valid but no username")
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 COOKIE_VALIDATED = False
-                log("STARTUP: Cookie EXPIRED (401)! Use /setcookie")
+                log("[STARTUP] Cookie EXPIRED! Use /setcookie to update.")
             else:
                 COOKIE_VALIDATED = True
-                log(f"STARTUP: Cookie check HTTP {e.code} (assuming valid)")
+                log(f"[STARTUP] Cookie check HTTP {e.code} (assuming valid)")
         except Exception as e:
             COOKIE_VALIDATED = True
-            log(f"STARTUP: Cookie check error: {type(e).__name__} (assuming valid)")
+            log(f"[STARTUP] Cookie check error (assuming valid): {str(e)[:50]}")
     else:
         COOKIE_VALIDATED = False
-        log("STARTUP: No cookie found! Use /setcookie to add one.")
+        log("[STARTUP] No cookie found! Use /setcookie to add one.")
     
-    # Start poller (DropHunter) and session keeper
-    log("STARTUP: Starting DropHunter...")
     threading.Thread(target=poller, daemon=True).start()
     try:
         threading.Thread(target=session_keeper, daemon=True).start()
-        log("STARTUP: Session keeper started")
+    except: pass
+    # Follow yesterday's drop streamers on startup
+    try:
+        campaigns, _ = fetch_campaigns()
+        if campaigns:
+            follow_drop_streamers(campaigns)
     except: pass
     
-    # Follow drop streamers on startup (with timeout protection)
-    try:
-        log("STARTUP: Fetching campaigns to follow streamers...")
-        campaigns, ok = fetch_campaigns()
-        if campaigns:
-            log(f"STARTUP: Found {len(campaigns)} campaigns, following streamers...")
-            follow_drop_streamers(campaigns)
-            log("STARTUP: Done following streamers")
-        else:
-            log(f"STARTUP: No campaigns (ok={ok})")
-    except Exception as e:
-        log(f"STARTUP: Follow error: {type(e).__name__}: {str(e)[:50]}")
-    
     status = "Cookie OK" if COOKIE_VALIDATED else "Cookie INVALID"
-    log(f"STARTUP: {status} - Bot ready!")
-    tg_send_admin(f"<b>Bot v25 Started!</b>\n\nCookie: {status}\nDrop Hunter: active\nActive Hours: 2 AM - 11 AM IST")
-    log("STARTUP: Listening for Telegram commands...")
+    tg_send_admin(f"<b>Bot v25 Started!</b>\n\nCookie: {status}\nDrop Hunter: active\nActive Hours: 2 AM - 11 AM IST\nManual: /watchtest works 24/7")
+    log("Listening... (24/7 mode - never stops!)")
     offset = 0
     while True:
         try:
-            updates = tg_get_updates(offset)
-            if updates:
-                log(f"MAIN: Got {len(updates)} Telegram updates")
-            for u in updates:
+            for u in tg_get_updates(offset):
                 offset = u["update_id"] + 1
                 msg = u.get("message", {})
                 cid = msg.get("chat", {}).get("id")
