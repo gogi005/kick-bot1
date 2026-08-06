@@ -1,4 +1,5 @@
-"""Kick Stake Drops Bot v28 - SIMPLE WEBSOCKETS + AUTH FIX
+"""
+Kick Stake Drops Bot v25 - TIME WINDOW + TEST MODE
 - ACTIVE HOURS: 2 AM to 11 AM IST (auto watch)
 - POLLING: 24/7 every 5 seconds (always detects new drops)
 - MANUAL: /watchtest works 24/7
@@ -13,26 +14,40 @@
 import urllib.request, json, time, os, threading, random, hashlib
 import asyncio
 import websockets
+import traceback
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# TLS fingerprint spoofing - defeats Cloudflare JA3/JA4 detection
-try:
-    import tls_client
-    HAS_TLS_CLIENT = True
-    print("[INIT] tls_client available - using Chrome 120 TLS fingerprint")
-except ImportError:
-    HAS_TLS_CLIENT = False
-    print("[INIT] tls_client NOT available - using urllib (bot detection likely)")
+# ============ HEAVY DEBUGGING ============
+VERBOSE_DEBUG = True  # Set True for maximum logging
 
-# curl_cffi - OPTIONAL for WebSocket Chrome TLS fingerprint
-try:
-    from curl_cffi.requests import AsyncSession as CurlAsyncSession
-    HAS_CURL_CFFI = True
-    print("[INIT] curl_cffi available")
-except ImportError:
-    HAS_CURL_CFFI = False
-    print("[INIT] curl_cffi not available (not required)")
+def vlog(tag, msg):
+    """Verbose debug log - only when VERBOSE_DEBUG is True"""
+    if VERBOSE_DEBUG:
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        try:
+            print(f"[V][{ts}][{tag}] {msg}", flush=True)
+        except UnicodeEncodeError:
+            safe = f"[V][{ts}][{tag}] {msg}".encode('ascii', errors='replace').decode('ascii')
+            print(safe, flush=True)
+
+def dbg_request(tag, url, headers=None, method="GET", body=None):
+    """Debug log for HTTP requests - sanitized (no cookie value)"""
+    if not VERBOSE_DEBUG: return
+    safe_headers = {}
+    if headers:
+        for k, v in headers.items():
+            if k.lower() == 'cookie':
+                safe_headers[k] = f'session=***({len(v)-8}chars)***' if len(v) > 8 else 'session=***'
+            elif k.lower() == 'authorization':
+                safe_headers[k] = f'Bearer ***({len(v)-7}chars)***' if len(v) > 7 else 'Bearer ***'
+            else:
+                safe_headers[k] = str(v)[:80]
+    vlog(tag, f">>> {method} {url}")
+    if safe_headers:
+        vlog(tag, f"    Headers: {json.dumps(safe_headers, default=str)[:300]}")
+    if body:
+        vlog(tag, f"    Body: {str(body)[:200]}")
 
 # Supabase database module (persistent storage)
 try:
@@ -68,7 +83,7 @@ FOLLOW_API = "https://kick.com/api/v2/channels/{channel_slug}/follow"
 FOLLOWED_API = "https://kick.com/api/v2/channels/followed"
 FOLLOW_COOLDOWN = {}  # username -> timestamp when retry allowed
 CATEGORY_LIVESTREAMS = "https://web.kick.com/api/v1/livestreams?category_id={cat_id}&limit=50&sort=viewer_count_desc"
-CATEGORIES_SEARCH_V1 = "https://kick.com/api/v1/categories"
+CATEGORIES_SEARCH = "https://kick.com/api/v2/categories"
 WS_TOKEN_API = "https://websockets.kick.com/viewer/v1/token"
 WS_URL_TEMPLATE = "wss://websockets.kick.com/viewer/v1/connect?token={token}"
 KICK_CLIENT_TOKEN = os.environ.get("KICK_CLIENT_TOKEN", "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823")
@@ -83,7 +98,6 @@ WATCHLIST_FILE = "tg_watchlist.json"  # Manual channel watchlist (persistent)
 DASHBOARD_PORT = int(os.environ.get("PORT", "8080"))
 KEEPER_INTERVAL = 1800
 SLOTS_CATEGORY_ID = None
-BOT_START_TIME = time.time()  # Track bot uptime
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -92,63 +106,6 @@ BASE_HEADERS = {
     "Referer": "https://kick.com/",
     "x-app-platform": "web",
 }
-
-# Basic browser headers for HTTP requests
-BROWSER_HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-}
-
-def get_tls_session():
-    """Get a tls_client session with Chrome 120 TLS fingerprint.
-    This defeats Cloudflare JA3/JA4 TLS fingerprinting detection."""
-    if not HAS_TLS_CLIENT:
-        return None
-    try:
-        s = tls_client.Session(
-            client_identifier="chrome_120",
-            random_tls_extension_order=True
-        )
-        s.headers.update(BROWSER_HEADERS)
-        return s
-    except Exception as e:
-        print(f"[TLS] Session error: {e}")
-        return None
-
-def tls_get(url, headers=None, timeout=10):
-    """HTTP GET using tls_client (Chrome TLS fingerprint).
-    Falls back to urllib if tls_client unavailable."""
-    s = get_tls_session()
-    if s:
-        if headers:
-            s.headers.update(headers)
-        try:
-            resp = s.get(url, timeout_seconds=timeout)
-            if resp.status_code == 200:
-                return resp.json()
-            elif resp.status_code in (403, 429):
-                print(f"[TLS] {url} -> HTTP {resp.status_code} (Cloudflare/rate limit)")
-                return None
-            else:
-                print(f"[TLS] {url} -> HTTP {resp.status_code}")
-                return None
-        except Exception as e:
-            print(f"[TLS] {url} error: {e}")
-            return None
-    else:
-        # Fallback to urllib
-        try:
-            req = urllib.request.Request(url)
-            for k, v in BASE_HEADERS.items():
-                req.add_header(k, v)
-            if headers:
-                for k, v in headers.items():
-                    req.add_header(k, v)
-            resp = urllib.request.urlopen(req, timeout=timeout)
-            return json.loads(resp.read().decode())
-        except:
-            return None
 # ================================
 
 LOG_BUFFER = []
@@ -159,12 +116,7 @@ _LOG_SAVE_TIMER = 0  # Debounce: only save logs every 30 seconds
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
-    try:
-        print(line, flush=True)
-    except UnicodeEncodeError:
-        # Windows cp1252 can't print emojis - encode safely
-        safe = line.encode('ascii', errors='replace').decode('ascii')
-        print(safe, flush=True)
+    print(line, flush=True)
     with LOG_LOCK:
         LOG_BUFFER.append({"time": datetime.now().isoformat(), "msg": msg})
         if len(LOG_BUFFER) > MAX_LOG_BUFFER:
@@ -205,33 +157,37 @@ def load_logs():
 # ---- Cookie ----
 import urllib.parse as _urlparse
 
-# Priority: User-specific > ENV var KICK_COOKIE
+# Priority: User-specific > Admin env var > Supabase global > local file
 def get_cookie(user_id=None):
-    """Get cookie DECODED: user-specific > ENV var > Supabase > local file"""
+    """Get cookie DECODED: user cookie > admin env cookie > Supabase > file"""
+    vlog("COOKIE", f"get_cookie(user_id={user_id}) called")
     raw = ""
-    
+    source = "none"
     # 1. User-specific cookie (if user called /setcookie)
     if user_id and USE_SUPABASE:
         try:
             user_data = db.get_user_cookie(user_id)
             if user_data and user_data.get("cookie"):
                 raw = user_data["cookie"]
-                print(f"[COOKIE] Using user {user_id} cookie ({len(raw)} chars)")
+                source = f"user_db(id={user_id})"
+                vlog("COOKIE", f"Found user cookie from DB: {len(raw)} chars")
         except Exception as e:
             print(f"[DB] get_user_cookie error: {e}")
     
-    # 2. ENV var KICK_COOKIE (admin cookie)
+    # 2. Admin env var cookie (KICK_COOKIE) — ALWAYS use this as default
     if not raw and INITIAL_COOKIE:
         raw = INITIAL_COOKIE
-        print(f"[COOKIE] Using ENV var KICK_COOKIE ({len(raw)} chars)")
+        source = "ENV_KICK_COOKIE"
+        vlog("COOKIE", f"Using ENV KICK_COOKIE: {len(raw)} chars")
     
-    # 3. Supabase global cookie
+    # 3. Supabase global cookie (old fallback)
     if not raw and USE_SUPABASE:
         try:
             c = db.load_cookie_db()
             if c:
                 raw = c
-                print(f"[COOKIE] Using Supabase global cookie ({len(raw)} chars)")
+                source = "supabase_global"
+                vlog("COOKIE", f"Using Supabase global: {len(raw)} chars")
         except Exception as e:
             print(f"[DB] get_cookie fallback: {e}")
     
@@ -241,13 +197,16 @@ def get_cookie(user_id=None):
             with open(COOKIE_FILE) as f:
                 raw = json.load(f).get("cookie", "")
                 if raw:
-                    print(f"[COOKIE] Using local file ({len(raw)} chars)")
+                    source = "local_file"
+                    vlog("COOKIE", f"Using local file: {len(raw)} chars")
         except: pass
     
     # ALWAYS decode: %7C → | (Kick needs decoded cookie)
     if raw:
-        return _urlparse.unquote(raw)
-    print("[COOKIE] NO COOKIE FOUND! Use /setcookie or set KICK_COOKIE env var")
+        decoded = _urlparse.unquote(raw)
+        vlog("COOKIE", f"Source: {source}, raw={len(raw)}chars, decoded={len(decoded)}chars, first10='{decoded[:10]}...'")
+        return decoded
+    vlog("COOKIE", "NO COOKIE FOUND! Returning empty string")
     return ""
 
 def save_cookie(cookie):
@@ -262,56 +221,45 @@ def save_cookie(cookie):
 
 # ---- Session Keeper (HTTP-based, no browser needed) ----
 def session_keeper():
-    """Keep session alive via HTTP check using tls_client."""
+    """Keep session alive via HTTP check."""
     global COOKIE_VALIDATED
     log("Session keeper started")
     while True:
         try:
+            vlog("KEEPER", f"--- Keepalive check (interval={KEEPER_INTERVAL}s) ---")
             cookie = get_cookie()
             if not cookie:
+                vlog("KEEPER", "No cookie found!")
                 log("[KEEPER] No cookie to refresh - USE /setcookie to add one!")
                 tg_send_admin("<b>⚠️ NO COOKIE SET!</b>\nUse /setcookie to update.")
                 time.sleep(KEEPER_INTERVAL)
                 continue
             
-            # Use tls_client for Chrome TLS fingerprint
-            s = get_tls_session()
-            if s:
-                s.headers["Cookie"] = f"session={cookie}"
-                s.headers["Authorization"] = f"Bearer {cookie}"
-                s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-                resp = s.get("https://kick.com/api/v2/users/me", timeout_seconds=10)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("username"):
-                        log(f"[KEEPER] Session alive - @{data['username']}")
-                        COOKIE_VALIDATED = True
-                    else:
-                        log("[KEEPER] Cookie valid but no user data")
-                        COOKIE_VALIDATED = True
-                elif resp.status_code == 401:
-                    log("[KEEPER] Cookie EXPIRED! Use /setcookie to update.")
-                    COOKIE_VALIDATED = False
-                    tg_send_admin("<b>🔴 Cookie EXPIRED!</b>\nBot cannot claim drops.\nSend /setcookie with new cookie.")
-                else:
-                    log(f"[KEEPER] HTTP {resp.status_code}")
+            vlog("KEEPER", f"Testing cookie: {len(cookie)} chars, first10='{cookie[:10]}...'")
+            headers = dict(BASE_HEADERS)
+            headers["Cookie"] = "session=" + cookie
+            headers["Authorization"] = f"Bearer {cookie}"
+            headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+            dbg_request("KEEPER", "https://kick.com/api/v2/users/me", headers, "GET")
+            req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
+            resp = urllib.request.urlopen(req, timeout=15)
+            data = json.loads(resp.read().decode())
+            vlog("KEEPER", f"Response keys: {list(data.keys())[:8]}")
+            
+            if data.get("username"):
+                log(f"[KEEPER] Session alive - @{data['username']}")
+                vlog("KEEPER", f"Cookie VALID for @{data['username']} (id={data.get('id', '?')})")
+                COOKIE_VALIDATED = True
             else:
-                # Fallback to urllib
-                headers = dict(BASE_HEADERS)
-                headers["Cookie"] = "session=" + cookie
-                headers["Authorization"] = f"Bearer {cookie}"
-                headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-                req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
-                resp = urllib.request.urlopen(req, timeout=15)
-                data = json.loads(resp.read().decode())
-                if data.get("username"):
-                    log(f"[KEEPER] Session alive - @{data['username']}")
-                    COOKIE_VALIDATED = True
-                else:
-                    log("[KEEPER] Cookie valid but no user data")
-                    COOKIE_VALIDATED = True
-                
+                log("[KEEPER] Cookie valid but no user data")
+                vlog("KEEPER", f"Cookie valid but no username. Full response: {json.dumps(data, default=str)[:200]}")
+                COOKIE_VALIDATED = True
+            
         except urllib.error.HTTPError as e:
+            resp_body = ""
+            try: resp_body = e.read().decode()[:200]
+            except: pass
+            vlog("KEEPER", f"HTTP {e.code} | Body: {resp_body}")
             if e.code == 401:
                 log("[KEEPER] Cookie EXPIRED! Use /setcookie to update.")
                 COOKIE_VALIDATED = False
@@ -322,6 +270,7 @@ def session_keeper():
             else:
                 log(f"[KEEPER] HTTP {e.code}")
         except Exception as e:
+            vlog("KEEPER", f"EXCEPTION: {type(e).__name__}: {str(e)[:100]}")
             log(f"[KEEPER] Error: {str(e)[:80]}")
         time.sleep(KEEPER_INTERVAL)
 
@@ -375,18 +324,24 @@ def get_active_subs():
 
 # ---- Telegram ----
 def tg_send(text, parse_mode="HTML", chat_id=None):
-    if not TG_TOKEN: return
+    if not TG_TOKEN:
+        vlog("TG", "No TG_TOKEN set!")
+        return
     targets = [chat_id] if chat_id else get_active_subs()
+    vlog("TG", f"Sending to {len(targets)} target(s): {targets[:3]}{'...' if len(targets) > 3 else ''}")
     for tid in targets:
         payload = json.dumps({"chat_id": tid, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}).encode()
         req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
         try:
             urllib.request.urlopen(req, timeout=15)
+            vlog("TG", f"OK to {tid}")
         except urllib.error.HTTPError as e:
+            vlog("TG", f"FAILED to {tid}: HTTP {e.code}")
             if chat_id == ADMIN_ID:
                 log(f"[TG] Admin notify failed: HTTP {e.code}")
         except Exception as e:
+            vlog("TG", f"ERROR to {tid}: {type(e).__name__}: {str(e)[:80]}")
             if chat_id == ADMIN_ID:
                 log(f"[TG] Admin notify error: {e}")
         time.sleep(0.05)
@@ -403,45 +358,37 @@ def tg_get_updates(offset=0):
 
 # ---- Kick API ----
 def kick_request(url, extra_headers=None, timeout=15, user_id=None):
+    vlog("KICK", f"kick_request: {url}")
     headers = dict(BASE_HEADERS)
     cookie = get_cookie(user_id)
     if cookie:
         headers["Cookie"] = "session=" + cookie
         headers["Authorization"] = f"Bearer {cookie}"
+        vlog("KICK", f"Cookie attached: {len(cookie)} chars")
+    else:
+        vlog("KICK", "WARNING: No cookie available!")
     headers["X-Client-Token"] = KICK_CLIENT_TOKEN
     if extra_headers: headers.update(extra_headers)
+    dbg_request("KICK", url, headers, "GET")
     req = urllib.request.Request(url)
     for k, v in headers.items(): req.add_header(k, v)
     try:
         resp = urllib.request.urlopen(req, timeout=timeout)
-        return json.loads(resp.read().decode())
+        data = json.loads(resp.read().decode())
+        vlog("KICK", f"<<< HTTP 200 | Response keys: {list(data.keys())[:5] if isinstance(data, dict) else type(data).__name__}")
+        if isinstance(data, dict) and 'data' in data:
+            d = data['data']
+            if isinstance(d, list):
+                vlog("KICK", f"    data[]: {len(d)} items")
+            elif isinstance(d, dict):
+                vlog("KICK", f"    data{{}}: keys={list(d.keys())[:5]}")
+        return data
     except urllib.error.HTTPError as e:
         raise
 
-def fetch_campaigns(user_id=None):
-    """Fetch campaigns using tls_client to bypass Cloudflare."""
-    s = get_tls_session()
-    if s:
-        try:
-            cookie = get_cookie(user_id)
-            if cookie:
-                s.headers["Cookie"] = f"session={cookie}"
-                s.headers["Authorization"] = f"Bearer {cookie}"
-            s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-            resp = s.get(DROPS_API, timeout_seconds=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get("data", []), True
-            elif resp.status_code in (401, 403):
-                return None, False
-            else:
-                return None, True
-        except Exception as e:
-            print(f"[CAMPAIGNS] tls_client error: {e}")
-    
-    # Fallback to urllib
+def fetch_campaigns():
     try:
-        data = kick_request(DROPS_API, user_id=user_id)
+        data = kick_request(DROPS_API)
         return data.get("data", []), True
     except urllib.error.HTTPError as e:
         if e.code in (401, 403): return None, False
@@ -449,46 +396,41 @@ def fetch_campaigns(user_id=None):
     except: return None, True
 
 def get_channel_info(username):
-    """Get channel info using tls_client to bypass Cloudflare detection."""
-    s = get_tls_session()
-    if s:
-        try:
-            resp = s.get(f"https://kick.com/api/v2/channels/{username}", timeout_seconds=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                livestream = data.get("livestream") or {}
-                return {
-                    "channel_id": data.get("id"),
-                    "livestream_id": livestream.get("id"),
-                    "username": data.get("slug", username),
-                    "is_live": bool(livestream.get("is_live")),
-                }
-        except Exception as e:
-            print(f"[CHANNEL] tls_client error @{username}: {e}")
-    
-    # Fallback to urllib
+    vlog("CHANNEL", f"get_channel_info(@{username})")
     try:
-        data = kick_request(CHANNEL_API.format(username=username))
+        url = CHANNEL_API.format(username=username)
+        data = kick_request(url)
         livestream = data.get("livestream") or {}
-        return {
+        result = {
             "channel_id": data.get("id"),
             "livestream_id": livestream.get("id"),
             "username": data.get("slug", username),
             "is_live": bool(livestream.get("is_live")),
         }
-    except: return None
+        vlog("CHANNEL", f"@{username}: channel_id={result['channel_id']}, ls_id={result['livestream_id']}, is_live={result['is_live']}")
+        return result
+    except urllib.error.HTTPError as e:
+        vlog("CHANNEL", f"@{username}: HTTP {e.code}")
+        return None
+    except Exception as e:
+        vlog("CHANNEL", f"@{username}: ERROR {type(e).__name__}: {str(e)[:80]}")
+        return None
 
 def follow_channel(username):
     """Follow a channel on Kick - with 429 backoff.
     Uses browser-like headers including XSRF token for Kasada bypass."""
     global FOLLOW_COOLDOWN
+    vlog("FOLLOW", f"follow_channel(@{username}) called")
     if username in FOLLOW_COOLDOWN:
-        if time.time() < FOLLOW_COOLDOWN[username]:
+        remaining = FOLLOW_COOLDOWN[username] - time.time()
+        if remaining > 0:
+            vlog("FOLLOW", f"@{username}: In cooldown, {remaining:.0f}s left - SKIP")
             return False
     try:
         url = FOLLOW_API.format(channel_slug=username)
         cookie = get_cookie()
         decoded = get_session_token()
+        vlog("FOLLOW", f"@{username}: cookie={len(cookie)}chars, token={'YES' if decoded else 'NO'}")
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -531,19 +473,25 @@ _followed_cache = {"data": None, "ts": 0, "failed": False}
 def get_followed_streamers():
     global _followed_cache
     now = time.time()
+    vlog("FOLLOWED", f"get_followed_streamers() called")
     # If failed due to 401, don't retry for 30 minutes
     if _followed_cache["failed"] and now - _followed_cache["ts"] < 1800:
+        remaining = 1800 - (now - _followed_cache["ts"])
+        vlog("FOLLOWED", f"Cached (failed), {remaining:.0f}s until retry, returning {len(_followed_cache['data'] or [])} cached")
         return _followed_cache["data"] or []
     # Cache for 5 minutes
     if _followed_cache["data"] is not None and now - _followed_cache["ts"] < 300:
+        vlog("FOLLOWED", f"Cached (fresh), returning {len(_followed_cache['data'])} cached")
         return _followed_cache["data"]
     try:
         data = kick_request(FOLLOWED_API)
         channels = data.get("channels", [])
         result = [ch.get("channel_slug") or ch.get("user_username") for ch in channels if ch.get("channel_slug")]
         _followed_cache = {"data": result, "ts": now, "failed": False}
+        vlog("FOLLOWED", f"SUCCESS: {len(result)} followed channels: {result[:5]}")
         return result
     except urllib.error.HTTPError as e:
+        vlog("FOLLOWED", f"HTTP {e.code}")
         if e.code == 401:
             _followed_cache["failed"] = True
             _followed_cache["ts"] = now
@@ -552,6 +500,7 @@ def get_followed_streamers():
             log(f"[FOLLOWED] HTTP {e.code}")
         return _followed_cache["data"] or []
     except Exception as e:
+        vlog("FOLLOWED", f"ERROR: {type(e).__name__}: {str(e)[:80]}")
         log(f"[FOLLOWED] Error: {e}")
         return _followed_cache["data"] or []
 
@@ -584,58 +533,24 @@ def try_claim_in_chat(username):
     return None
 
 def get_ws_token(session_token):
-    """Get WebSocket viewer token using tls_client for Chrome TLS fingerprint.
-    MUST include session cookie + Bearer auth for drop tracking to work!
-    Matches kickautodrops pattern: cookies + Bearer + X-Client-Token."""
-    s = get_tls_session()
-    if s:
-        try:
-            # First visit kick.com to establish Cloudflare clearance cookies
-            s.get("https://kick.com/", timeout_seconds=10)
-            
-            # CRITICAL: Must include session cookie AND Bearer auth
-            # Without auth, the WS token won't track drop progress!
-            if session_token:
-                s.headers["Cookie"] = f"session={session_token}"
-                s.headers["Authorization"] = f"Bearer {session_token}"
-            s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-            s.headers["Accept"] = "application/json, text/plain, */*"
-            s.headers["Referer"] = "https://kick.com/"
-            s.headers["Origin"] = "https://kick.com"
-            s.headers["Sec-Fetch-Site"] = "same-site"
-            resp = s.get("https://websockets.kick.com/viewer/v1/token", timeout_seconds=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                token = data.get("data", {}).get("token")
-                if token:
-                    print(f"[WS-TOKEN] Got token with auth ({len(token)} chars)")
-                    return token
-                else:
-                    print(f"[WS-TOKEN] 200 but no token in response: {str(data)[:200]}")
-            else:
-                print(f"[WS-TOKEN] tls_client HTTP {resp.status_code}: {resp.text[:200]}")
-        except Exception as e:
-            print(f"[WS-TOKEN] tls_client error: {e}")
-    
-    # Fallback to urllib - MUST include Bearer auth
+    vlog("WS", f"get_ws_token() called, token={'YES' if session_token else 'NO'}")
     try:
-        headers = dict(BASE_HEADERS)
-        if session_token:
-            headers["Cookie"] = f"session={session_token}"
-            headers["Authorization"] = f"Bearer {session_token}"
-        headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-        headers["Sec-Fetch-Site"] = "same-site"
-        req = urllib.request.Request(WS_TOKEN_API)
-        for k, v in headers.items():
-            req.add_header(k, v)
-        resp = urllib.request.urlopen(req, timeout=15)
-        data = json.loads(resp.read().decode())
-        token = data.get("data", {}).get("token")
-        if token:
-            print(f"[WS-TOKEN] Got token via urllib with auth ({len(token)} chars)")
-        return token
+        data = kick_request(WS_TOKEN_API, extra_headers={
+            "Authorization": f"Bearer {session_token}",
+            "X-Client-Token": KICK_CLIENT_TOKEN,
+            "Sec-Fetch-Site": "same-site",
+        })
+        ws_token = data.get("data", {}).get("token")
+        if ws_token:
+            vlog("WS", f"SUCCESS: Got WS token ({len(ws_token)} chars)")
+        else:
+            vlog("WS", f"FAILED: No token in response. Keys: {list(data.keys())}")
+        return ws_token
+    except urllib.error.HTTPError as e:
+        vlog("WS", f"FAILED: HTTP {e.code}")
+        return None
     except Exception as e:
-        print(f"[WS-TOKEN] urllib error: {e}")
+        vlog("WS", f"FAILED: {type(e).__name__}: {str(e)[:80]}")
         return None
 
 def get_session_token(user_id=None):
@@ -643,77 +558,22 @@ def get_session_token(user_id=None):
     return get_cookie(user_id)  # Already decoded by get_cookie()
 
 def validate_cookie_and_get_user(cookie):
-    """Validate cookie by fetching user info from Kick using tls_client.
-    Returns (valid, username, user_id)
-    
-    Priority:
-    1. kick.com/api/v2/users/me (BEST - returns actual username + user ID)
-    2. kick.com/api/v2/channels/followed (fallback - only validates, no username)
-    3. kick.com/api/v1/drops/campaigns (fallback - only validates)
-    """
-    # Ensure cookie is decoded (| not %7C)
+    """Validate cookie by fetching followed channels from Kick.
+    Returns (valid, username_or_count, user_id_or_channels)
+    Note: users/me returns 404 due to Kasada, so we use followed API instead."""
     try:
-        decoded = _urlparse.unquote(cookie)
-    except:
-        decoded = cookie
-    
-    if not decoded or len(decoded) < 10:
-        log("[COOKIE] Validation failed: cookie too short or empty")
-        return False, None, None
-    
-    # Method 1: Try users/me API using tls_client (BEST)
-    s = get_tls_session()
-    if s:
+        # Ensure cookie is decoded (| not %7C)
         try:
-            s.headers["Cookie"] = f"session={decoded}"
-            s.headers["Authorization"] = f"Bearer {decoded}"
-            s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-            resp = s.get("https://kick.com/api/v2/users/me", timeout_seconds=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("username"):
-                    log(f"[COOKIE] Valid via users/me: @{data['username']} (ID: {data.get('id', '?')})")
-                    return True, data["username"], data.get("id", 0)
-                elif data.get("id"):
-                    log(f"[COOKIE] Valid via users/me: ID={data['id']} (no username)")
-                    return True, f"user_{data['id']}", data["id"]
-            else:
-                log(f"[COOKIE] Method 1 (users/me) failed: HTTP {resp.status_code}")
-        except Exception as e:
-            log(f"[COOKIE] Method 1 tls_client error: {e}")
-    
-    # Method 1 fallback: urllib
-    try:
+            import urllib.parse
+            decoded = urllib.parse.unquote(cookie)
+        except:
+            decoded = cookie
+        
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + decoded
-        headers["Authorization"] = "Bearer " + decoded
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
         
-        req = urllib.request.Request("https://kick.com/api/v2/users/me")
-        for k, v in headers.items():
-            req.add_header(k, v)
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(resp.read().decode())
-        
-        if data.get("username"):
-            log(f"[COOKIE] Valid via users/me: @{data['username']} (ID: {data.get('id', '?')})")
-            return True, data["username"], data.get("id", 0)
-        elif data.get("id"):
-            log(f"[COOKIE] Valid via users/me: ID={data['id']} (no username)")
-            return True, f"user_{data['id']}", data["id"]
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:200] if e.fp else ""
-        log(f"[COOKIE] Method 1 (users/me) failed: HTTP {e.code}: {body}")
-    except Exception as e:
-        log(f"[COOKIE] Method 1 error: {e}")
-    
-    # Method 2: Try followed channels API (validates but no username)
-    try:
-        headers = dict(BASE_HEADERS)
-        headers["Cookie"] = "session=" + decoded
-        headers["Authorization"] = "Bearer " + decoded
-        headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-        
+        # Use followed API (users/me returns 404 due to Kasada)
         req = urllib.request.Request("https://kick.com/api/v2/channels/followed")
         for k, v in headers.items():
             req.add_header(k, v)
@@ -724,263 +584,126 @@ def validate_cookie_and_get_user(cookie):
         if channels is not None:  # Valid response
             channel_names = [ch.get("channel_slug", "?") for ch in channels[:3]]
             log(f"[COOKIE] Valid! {len(channels)} followed channels: {', '.join(channel_names)}")
-            return True, None, None  # Valid but no username
+            return True, f"{len(channels)} channels", len(channels)
+        return False, None, None
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:200] if e.fp else ""
-        log(f"[COOKIE] Method 2 (followed) failed: HTTP {e.code}: {body}")
+        log(f"[COOKIE] Validation failed: HTTP {e.code}: {body}")
+        return False, None, None
     except Exception as e:
-        log(f"[COOKIE] Method 2 error: {e}")
-    
-    # Method 3: Try drops API (if cookie is for claiming)
-    try:
-        headers = dict(BASE_HEADERS)
-        headers["Cookie"] = "session=" + decoded
-        headers["Authorization"] = "Bearer " + decoded
-        headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-        
-        req = urllib.request.Request("https://web.kick.com/api/v1/drops/campaigns")
-        for k, v in headers.items():
-            req.add_header(k, v)
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(resp.read().decode())
-        campaigns = data.get("data", [])
-        
-        if campaigns is not None:  # Valid response (even if empty)
-            log(f"[COOKIE] Cookie accepted by drops endpoint! {len(campaigns)} campaigns available")
-            return True, None, None  # Valid but no username
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()[:200] if e.fp else ""
-        log(f"[COOKIE] Method 3 (drops) failed: HTTP {e.code}: {body}")
-    except Exception as e:
-        log(f"[COOKIE] Method 3 error: {e}")
-    
-    log("[COOKIE] All validation methods failed - cookie may be expired or invalid")
-    return False, None, None
+        log(f"[COOKIE] Validation error: {e}")
+        return False, None, None
 
-_progress_cache = {"data": None, "ts": 0, "fail_count": 0}
+_progress_cache = {"data": None, "ts": 0}
 
 def fetch_progress(user_id=None):
-    """Fetch drop progress using tls_client to bypass Cloudflare Kasada."""
     global _progress_cache
     now = time.time()
-    cache_ttl = 60 if _progress_cache.get("fail_count", 0) > 3 else 30
-    if _progress_cache["data"] is not None and now - _progress_cache["ts"] < cache_ttl:
+    vlog("PROGRESS", f"fetch_progress(user={user_id}) called")
+    # Cache for 5 seconds to avoid 403 rate limits
+    cache_key = f"user_{user_id}" if user_id else "global"
+    if _progress_cache["data"] is not None and now - _progress_cache["ts"] < 5:
+        vlog("PROGRESS", f"Cached ({now - _progress_cache['ts']:.1f}s old), returning {len(_progress_cache['data'] or [])} items")
         return _progress_cache["data"]
-    
-    s = get_tls_session()
-    if s:
-        try:
-            cookie = get_cookie(user_id)
-            if cookie:
-                s.headers["Cookie"] = f"session={cookie}"
-                s.headers["Authorization"] = f"Bearer {cookie}"
-            s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-            resp = s.get(PROGRESS_API, timeout_seconds=10)
-            if resp.status_code == 200:
-                data = resp.json().get("data", [])
-                _progress_cache = {"data": data, "ts": now, "fail_count": 0}
-                return data
-            else:
-                _progress_cache["fail_count"] = _progress_cache.get("fail_count", 0) + 1
-                print(f"[PROGRESS] tls_client HTTP {resp.status_code}")
-                return _progress_cache["data"] or []
-        except Exception as e:
-            _progress_cache["fail_count"] = _progress_cache.get("fail_count", 0) + 1
-            print(f"[PROGRESS] tls_client error: {e}")
-    
-    # Fallback to urllib
     try:
         cookie = get_cookie(user_id)
+        if not cookie:
+            vlog("PROGRESS", "FAILED: No cookie!")
+            return []
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + cookie
-        headers["Authorization"] = f"Bearer {get_session_token(user_id)}"
+        headers["Authorization"] = f"Bearer {get_session_token()}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+        dbg_request("PROGRESS", PROGRESS_API, headers, "GET")
         req = urllib.request.Request(PROGRESS_API)
         for k, v in headers.items(): req.add_header(k, v)
         resp = urllib.request.urlopen(req, timeout=15)
         data = json.loads(resp.read().decode()).get("data", [])
-        _progress_cache = {"data": data, "ts": now, "fail_count": 0}
+        vlog("PROGRESS", f"SUCCESS: {len(data)} progress items")
+        _progress_cache = {"data": data, "ts": now}
         return data
     except urllib.error.HTTPError as e:
-        _progress_cache["fail_count"] = _progress_cache.get("fail_count", 0) + 1
+        resp_body = e.read().decode()[:200] if e.fp else ''
+        vlog("PROGRESS", f"HTTP {e.code}: {resp_body}")
+        log(f"[PROGRESS] HTTP {e.code}: {resp_body}")
         return _progress_cache["data"] or []
     except Exception as e:
-        _progress_cache["fail_count"] = _progress_cache.get("fail_count", 0) + 1
+        vlog("PROGRESS", f"ERROR: {type(e).__name__}: {str(e)[:100]}")
+        log(f"[PROGRESS] Error: {e}")
         return _progress_cache["data"] or []
 
 def claim_reward(campaign_id, reward_id, user_id=None):
-    """Claim reward using tls_client for Cloudflare bypass."""
-    s = get_tls_session()
-    if s:
-        try:
-            cookie = get_cookie(user_id)
-            if cookie:
-                s.headers["Cookie"] = f"session={cookie}"
-                s.headers["Authorization"] = f"Bearer {cookie}"
-            s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-            s.headers["Content-Type"] = "application/json"
-            body = json.dumps({"campaign_id": campaign_id, "reward_id": reward_id})
-            resp = s.post(CLAIM_API, data=body, timeout_seconds=10)
-            if resp.status_code == 200:
-                result = resp.json()
-                log(f"[CLAIM] OK: {result}")
-                return result
-            else:
-                log(f"[CLAIM] HTTP {resp.status_code}: {resp.text[:200]}")
-                return None
-        except Exception as e:
-            log(f"[CLAIM] tls_client error: {e}")
-    
-    # Fallback to urllib
+    vlog("CLAIM", f"claim_reward(campaign={campaign_id}, reward={reward_id}, user={user_id})")
     try:
         cookie = get_cookie(user_id)
+        if not cookie:
+            vlog("CLAIM", "FAILED: No cookie!")
+            return None
         headers = dict(BASE_HEADERS)
         headers["Cookie"] = "session=" + cookie
         headers["Authorization"] = f"Bearer {cookie}"
         headers["X-Client-Token"] = KICK_CLIENT_TOKEN
         headers["Content-Type"] = "application/json"
-        body = json.dumps({"campaign_id": campaign_id, "reward_id": reward_id}).encode()
-        req = urllib.request.Request(CLAIM_API, data=body, method="POST")
+        body = json.dumps({"campaign_id": campaign_id, "reward_id": reward_id})
+        vlog("CLAIM", f"Request body: {body}")
+        dbg_request("CLAIM", CLAIM_API, headers, "POST", body)
+        req = urllib.request.Request(CLAIM_API, data=body.encode(), method="POST")
         for k, v in headers.items(): req.add_header(k, v)
         resp = urllib.request.urlopen(req, timeout=15)
         result = json.loads(resp.read().decode())
+        vlog("CLAIM", f"<<< HTTP 200 | Result: {json.dumps(result, default=str)[:300]}")
         log(f"[CLAIM] OK: {result}")
         return result
     except urllib.error.HTTPError as e:
-        body = e.read().decode()[:300] if e.fp else ""
-        log(f"[CLAIM] HTTP {e.code}: {body}")
+        resp_body = e.read().decode()[:300] if e.fp else ""
+        vlog("CLAIM", f"<<< HTTP {e.code} | Body: {resp_body}")
+        log(f"[CLAIM] HTTP {e.code}: {resp_body}")
         return None
     except Exception as e:
+        vlog("CLAIM", f"ERROR: {type(e).__name__}: {str(e)[:100]}")
         log(f"[CLAIM] Error: {e}")
         return None
 
 def search_slots_category():
-    """Find Slots & Casino category ID using working v1 API.
-    v2/categories is Kasada-blocked, so we use v1/categories instead."""
+    """Find Slots & Casino category ID"""
     global SLOTS_CATEGORY_ID
     if SLOTS_CATEGORY_ID: return SLOTS_CATEGORY_ID
-    
-    # Method 1: Use v1/categories API (works without Kasada)
     try:
-        req = urllib.request.Request(CATEGORIES_SEARCH_V1)
-        for k, v in BASE_HEADERS.items():
-            req.add_header(k, v)
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(resp.read().decode())
+        data = kick_request(CATEGORIES_SEARCH)
         categories = data if isinstance(data, list) else data.get("data", [])
         for cat in categories:
             name = cat.get("name", "").lower()
-            if "gambling" in name:  # Gambling = parent of Slots & Casino
+            if "slots" in name or "casino" in name:
                 SLOTS_CATEGORY_ID = cat.get("id")
-                log(f"[CAT] Found Gambling category ID: {SLOTS_CATEGORY_ID}")
+                log(f"[CAT] Slots & Casino category ID: {SLOTS_CATEGORY_ID}")
                 return SLOTS_CATEGORY_ID
-    except Exception as e:
-        log(f"[CAT] v1 categories search error: {e}")
-    
-    # Method 2: Hardcode known Gambling category ID (4)
-    SLOTS_CATEGORY_ID = 4
-    log("[CAT] Using hardcoded Gambling category ID: 4")
-    return SLOTS_CATEGORY_ID
-
-_slots_cache = {"data": [], "ts": 0}
+    except: pass
+    return None
 
 def get_slots_streamers():
-    """Get ALL live streamers from Slots & Casino category.
-    Uses category-specific API (category_id=28) for complete results.
-    Falls back to filter-based approach if category API fails.
-    Caches results for 30 seconds to avoid excessive API calls."""
-    global _slots_cache
-    now = time.time()
-    
-    # Return cached if fresh (< 30 seconds)
-    if _slots_cache["data"] and now - _slots_cache["ts"] < 30:
-        return _slots_cache["data"]
-    
-    result = []
-    total_checked = 0
-    
-    # Method 1: Category-specific API (SLOTS_CATEGORY_ID = 28)
-    # This returns ONLY Slots & Casino streams - all 50+ live!
-    SLOTS_CAT_ID = 28
+    """Get live streamers from Slots & Casino category as fallback"""
+    cat_id = search_slots_category()
+    if not cat_id: return []
     try:
-        url = f"https://web.kick.com/api/v1/livestreams?category_id={SLOTS_CAT_ID}&limit=200&sort=viewer_count_desc"
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", BASE_HEADERS["User-Agent"])
-        req.add_header("Accept", "application/json")
-        resp = urllib.request.urlopen(req, timeout=15)
-        data = json.loads(resp.read().decode())
-        livestreams = data.get("data", {}).get("livestreams", [])
-        total_checked = len(livestreams)
-        
-        for s in livestreams:
-            channel = s.get("channel", {})
-            username = channel.get("username", "")
-            channel_id = channel.get("id")
-            livestream_id = s.get("id")
-            cat = s.get("category", {})
-            
+        data = kick_request(CATEGORY_LIVESTREAMS.format(cat_id=cat_id))
+        streams = data.get("data", []) if isinstance(data, dict) else data
+        result = []
+        for s in streams:
+            user = s.get("broadcaster_user", {}) if "broadcaster_user" in s else s.get("channel", {})
+            username = user.get("username", "") or s.get("slug", "")
+            channel_id = user.get("id") or s.get("channel_id")
+            livestream_id = s.get("id") or s.get("livestream_id")
             if username and channel_id:
-                result.append({
-                    "username": username,
-                    "channel_id": channel_id,
-                    "livestream_id": livestream_id,
-                    "category": cat.get("name", "Slots & Casino"),
-                    "viewers": s.get("viewer_count", 0)
-                })
-        
-        if result:
-            _slots_cache = {"data": result, "ts": now}
-            log(f"[CAT] Found {len(result)} Slots & Casino streamers (cat_id={SLOTS_CAT_ID}) from {total_checked} live")
-            return result
-    except Exception as e:
-        log(f"[CAT] Category API error: {e}")
-    
-    # Method 2: Fallback - fetch all live and filter by gambling keywords
-    try:
-        url = "https://web.kick.com/api/v1/livestreams?limit=200&sort=viewer_count_desc"
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", BASE_HEADERS["User-Agent"])
-        req.add_header("Accept", "application/json")
-        resp = urllib.request.urlopen(req, timeout=15)
-        data = json.loads(resp.read().decode())
-        livestreams = data.get("data", {}).get("livestreams", [])
-        total_checked = len(livestreams)
-        
-        GAMBLING_KEYWORDS = ["slot", "casino", "poker", "blackjack", "roulette", "baccarat", "gambling", "craps", "bingo"]
-        
-        for s in livestreams:
-            cat = s.get("category", {})
-            cat_name = cat.get("name", "").lower()
-            cat_slug = cat.get("slug", "").lower()
-            
-            if any(kw in cat_name or kw in cat_slug for kw in GAMBLING_KEYWORDS):
-                channel = s.get("channel", {})
-                username = channel.get("username", "")
-                channel_id = channel.get("id")
-                livestream_id = s.get("id")
-                
-                if username and channel_id:
-                    result.append({
-                        "username": username,
-                        "channel_id": channel_id,
-                        "livestream_id": livestream_id,
-                        "category": cat.get("name", "?"),
-                        "viewers": s.get("viewer_count", 0)
-                    })
-        
-        _slots_cache = {"data": result, "ts": now}
-        log(f"[CAT] Fallback: Found {len(result)} Gambling streamers from {total_checked} total live")
+                result.append({"username": username, "channel_id": channel_id, "livestream_id": livestream_id})
+        log(f"[CAT] Found {len(result)} Slots & Casino streamers")
         return result
-    except Exception as e:
-        log(f"[CAT] Fallback error: {e}")
-        return _slots_cache.get("data", [])
+    except: return []
 
-def smart_claim_check(username=None, user_id=None):
-    """Smart claim check - progress is RATIO (0-1), not seconds.
-    Uses user's cookie if user_id provided."""
+def smart_claim_check(username=None):
+    """Smart claim check - progress is RATIO (0-1), not seconds"""
     global _progress_cache
     try:
-        progress = fetch_progress(user_id=user_id)
+        progress = fetch_progress()
         if not progress: return
         claimed_any = False
         for item in progress:
@@ -994,7 +717,7 @@ def smart_claim_check(username=None, user_id=None):
                 claim_key = f"{campaign_id}_{reward_id}"
                 if required > 0 and ratio >= 1.0:
                     log(f"[CLAIM] CLAIMABLE! {total_progress}/{required}s (ratio={ratio})")
-                    result = claim_reward(campaign_id, reward_id, user_id=user_id)
+                    result = claim_reward(campaign_id, reward_id)
                     if result:
                         claimed_any = True
                         tg_send(f"<b>🎉 REWARD CLAIMED!</b>\nStreamer: @{username or '?'}\nCampaign: ATK Drop\nReward: {r.get('name', reward_id[:16])}")
@@ -1009,57 +732,16 @@ def smart_claim_check(username=None, user_id=None):
         log(f"[CLAIM] Check error: {e}")
         return False
 
-async def send_user_event(ws, channel_id, livestream_id, session=None):
-    ls_id = livestream_id or channel_id
+async def send_user_event(ws, channel_id, livestream_id):
+    ls_id = int(livestream_id) if livestream_id else int(channel_id)
     event = {"type": "user_event", "data": {"message": {
         "name": "tracking.user.watch.livestream",
         "channel_id": channel_id,
-        "livestream_id": int(ls_id) if str(ls_id).isdigit() else ls_id,
+        "livestream_id": ls_id,
     }}}
-    await ws_send(ws, json.dumps(event), session)
-
-# ============================================================
-#  CURL_CFFI WEBSOCKET HELPER - Chrome TLS fingerprint
-# ============================================================
-async def ws_connect(ws_url, headers, user_id=None):
-    """Connect to WebSocket for Kick.com drop tracking.
-    Uses plain websockets library - simple and reliable.
-    Session cookie included for authenticated drop tracking."""
-    cookie = get_cookie(user_id)
-    ws_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Origin": "https://kick.com",
-        "Referer": "https://kick.com/",
-    }
-    if cookie:
-        # CRITICAL: Kick.com session cookie is named 'session' NOT 'session_token'!
-        ws_headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}; session={cookie}"
-        ws_headers["Authorization"] = f"Bearer {cookie}"
-    else:
-        ws_headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
-    headers.update(ws_headers)
-    
-    # Plain websockets library - works reliably
-    import websockets
-    ws = await websockets.connect(ws_url, additional_headers=ws_headers)
-    return ws, None  # Return (ws, session) tuple for compatibility
-
-async def ws_send(ws, data, session=None):
-    """Send message via WebSocket."""
-    await ws.send(data)
-
-async def ws_recv(ws, session=None, timeout=1.0):
-    """Receive message from WS with timeout."""
-    try:
-        msg = await asyncio.wait_for(ws.recv(), timeout=timeout)
-        return msg
-    except:
-        return None
-
-# Keep old function names as aliases for backward compatibility
-curl_ws_connect = ws_connect
-curl_ws_send = ws_send
-curl_ws_recv = ws_recv
+    vlog("WS-EVENT", f"Sending: channel={channel_id}, livestream={ls_id}")
+    await ws.send(json.dumps(event))
+    vlog("WS-EVENT", "Sent OK")
 
 def fmt_duration(seconds):
     h = int(seconds) // 3600
@@ -1263,22 +945,21 @@ def remove_from_watchlist(username):
 _watchlist_local_cache = set()
 
 def get_watchlist():
-    """Get all channels in the watchlist. ALWAYS returns a list."""
+    """Get all channels in the watchlist."""
     global _watchlist_local_cache
     if _watchlist_local_cache:
         return list(_watchlist_local_cache)
     if USE_SUPABASE:
         try:
             result = db.get_watchlist_db()
-            if result:
-                _watchlist_local_cache = set(result)
-                return result
+            _watchlist_local_cache = set(result) if result else set()
+            return result
         except Exception as e:
             print(f"[DB] get_watchlist fallback: {e}")
     watchlist = load_watchlist()
-    result = watchlist.get("channels", []) if isinstance(watchlist, dict) else []
+    result = watchlist.get("channels", [])
     _watchlist_local_cache = set(result)
-    return result or []
+    return result
 
 def follow_drop_streamers(campaigns):
     """Follow all streamers from active Stake drops"""
@@ -1334,8 +1015,7 @@ class SingleWatcher:
         self.started_at = None
 
     def start(self, chat_id, usernames):
-        """Start watching multiple streamers simultaneously.
-        Uses user's cookie if they set one via /setcookie."""
+        """Start watching multiple streamers simultaneously"""
         if isinstance(usernames, str):
             usernames = [usernames]
 
@@ -1347,14 +1027,14 @@ class SingleWatcher:
             if username in self.watchers:
                 failed.append(f"@{username} (already watching)")
                 continue
-            info = get_channel_info(username)  # Uses user's cookie via get_cookie(chat_id)
+            info = get_channel_info(username)
             if not info:
                 failed.append(f"@{username} (not found)")
                 continue
             if not info.get("is_live"):
                 failed.append(f"@{username} (offline)")
                 continue
-            watcher = SingleStreamWatcher(username, info["channel_id"], info.get("livestream_id"), self, user_id=chat_id)
+            watcher = SingleStreamWatcher(username, info["channel_id"], info.get("livestream_id"), self)
             with self._lock:
                 self.watchers[username] = watcher
                 self.active = True
@@ -1425,12 +1105,11 @@ class SingleWatcher:
 
 
 class SingleStreamWatcher:
-    def __init__(self, username, channel_id, livestream_id, parent, user_id=None):
+    def __init__(self, username, channel_id, livestream_id, parent):
         self.username = username
         self.channel_id = channel_id
         self.livestream_id = livestream_id
         self.parent = parent
-        self.user_id = user_id  # Per-user cookie support
         self.stop_event = threading.Event()
         self.started_at = datetime.now()
         self.watch_time = 0
@@ -1455,11 +1134,14 @@ class SingleStreamWatcher:
             self.parent.on_watcher_done(self.username)
 
     def _ws_connect(self):
-        ws_token = get_ws_token(get_cookie(self.user_id))  # Use user's cookie
-        if not ws_token: raise Exception("No WS token")
+        vlog("WS-CONN", f"@{self.username}: Getting WS token...")
+        ws_token = get_ws_token(get_cookie())
+        if not ws_token:
+            vlog("WS-CONN", f"@{self.username}: No WS token! Raising exception.")
+            raise Exception("No WS token")
+        vlog("WS-CONN", f"@{self.username}: Got WS token ({len(ws_token)} chars)")
         ws_url = WS_URL_TEMPLATE.format(token=ws_token)
         headers = dict(BASE_HEADERS)
-        headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try: loop.run_until_complete(self._ws_loop(ws_url, headers))
@@ -1469,53 +1151,41 @@ class SingleStreamWatcher:
         username = self.username
         channel_id = self.channel_id
         livestream_id = self.livestream_id
-        ls_id = livestream_id or channel_id
-        ws, session = await curl_ws_connect(ws_url, headers, user_id=self.user_id)
-        
-        try:
-            # Initial handshake
-            await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-            await curl_ws_recv(ws, session, timeout=3)
-            await send_user_event(ws, channel_id, ls_id, session)
+        vlog("WATCH-WS", f"@{username}: Connecting... ch={channel_id}, ls={livestream_id}")
+        async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+            vlog("WATCH-WS", f"@{username}: Connected! Sending handshake...")
+            await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
+            try: await asyncio.wait_for(ws.recv(), timeout=5)
+            except: vlog("WATCH-WS", f"@{username}: Handshake recv timeout (normal)")
+            vlog("WATCH-WS", f"@{username}: Sending initial user_event...")
+            await send_user_event(ws, channel_id, livestream_id)
             with self._lock: self.events_sent += 1
-            log(f"[WATCH] Connected @{username} channel_id={channel_id} livestream_id={ls_id}")
-            
-            counter = 0
+            log(f"[WATCH] Connected @{username} channel_id={channel_id} livestream_id={livestream_id}")
+            vlog("WATCH-WS", f"@{username}: Initial event sent, entering loop")
             last_ue = time.time()
+            last_ping = time.time()
             last_alive = time.time()
             last_refresh = time.time()
             watch_start = time.time()
-            ue_interval = random.randint(45, 65)
-            
             while not self.stop_event.is_set():
-                counter += 1
                 now = time.time()
                 elapsed_since_start = now - watch_start
-                
-                # Alternate ping/channel_handshake every 13-18s
-                if counter % 2 == 0:
-                    await curl_ws_send(ws, json.dumps({"type": "ping"}), session)
-                else:
-                    await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-                
-                await curl_ws_recv(ws, session, timeout=1.0)
-                await asyncio.sleep(random.randint(13, 18))
-                
-                now = time.time()
-                elapsed_since_start = now - watch_start
-                
-                # user_event every 60s
-                if now - last_ue >= ue_interval:
-                    await send_user_event(ws, channel_id, ls_id, session)
+                if now - last_ping >= 20:
+                    try:
+                        await ws.send(json.dumps({"type": "ping"}))
+                        last_ping = now
+                        try: await asyncio.wait_for(ws.recv(), timeout=3)
+                        except: pass
+                    except: pass
+                if now - last_ue >= 60:
+                    await send_user_event(ws, channel_id, livestream_id)
                     with self._lock:
                         self.events_sent += 1
                         self.watch_time += 60
                     last_ue = now
-                    ue_interval = random.randint(45, 65)
                     if elapsed_since_start >= 60:
-                        smart_claim_check(username, user_id=self.user_id)
+                        smart_claim_check(username)
                     log(f"[WATCH] event #{self.events_sent} @{username} ({fmt_duration(self.watch_time)})")
-                
                 if now - last_refresh >= 300:
                     last_refresh = now
                     try:
@@ -1524,28 +1194,17 @@ class SingleStreamWatcher:
                             if info["livestream_id"] != livestream_id:
                                 livestream_id = info["livestream_id"]
                                 self.livestream_id = livestream_id
-                                ls_id = livestream_id
                                 log(f"[WATCH] Updated livestream_id={livestream_id} for @{username}")
                     except: pass
-                
                 if now - last_alive >= 300:
                     last_alive = now
                     info = get_channel_info(username)
                     if not info or not info.get("is_live"):
                         log(f"[WATCH] @{username} offline")
                         return
-        finally:
-            if session:
-                try: await session.close()
-                except: pass
+                await asyncio.sleep(1)
 
-# Per-user watchers: each user gets their own SingleWatcher
-single_watchers = {}  # user_id -> SingleWatcher
-def get_single_watcher(user_id):
-    """Get or create SingleWatcher for specific user"""
-    if user_id not in single_watchers:
-        single_watchers[user_id] = SingleWatcher()
-    return single_watchers[user_id]
+single_watcher = SingleWatcher()
 
 # ============================================================
 #  PARALLEL WATCHER
@@ -1730,7 +1389,6 @@ class StreamWatcher:
             if not ws_token: return
             ws_url = WS_URL_TEMPLATE.format(token=ws_token)
             headers = dict(BASE_HEADERS)
-            headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try: loop.run_until_complete(self._watch(ws_url, headers))
@@ -1744,45 +1402,34 @@ class StreamWatcher:
         username = self.username
         channel_id = self.channel_id
         livestream_id = self.livestream_id
-        ls_id = livestream_id or channel_id
-        ws, session = await curl_ws_connect(ws_url, headers)
-        
-        try:
-            await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-            await curl_ws_recv(ws, session, timeout=3)
-            await send_user_event(ws, channel_id, ls_id, session)
-            log(f"[SW] Connected @{username} channel_id={channel_id} livestream_id={ls_id}")
-            
+        async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+            await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
+            try: await asyncio.wait_for(ws.recv(), timeout=5)
+            except: pass
+            await send_user_event(ws, channel_id, livestream_id)
+            log(f"[SW] Connected @{username} channel_id={channel_id} livestream_id={livestream_id}")
             start = time.time()
             last_ue = time.time()
+            last_ping = time.time()
             last_refresh = time.time()
             ev_count = 1
-            ue_interval = random.randint(45, 65)
-            counter = 0
-            
             while not self.stop_event.is_set():
-                counter += 1
                 now = time.time()
                 elapsed = now - start
                 if elapsed >= self.target_seconds:
                     log(f"[SW] Done @{username} ({int(elapsed)}s)")
                     return
-                
-                if counter % 2 == 0:
-                    await curl_ws_send(ws, json.dumps({"type": "ping"}), session)
-                else:
-                    await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-                
-                await curl_ws_recv(ws, session, timeout=1.0)
-                await asyncio.sleep(random.randint(13, 18))
-                
-                now = time.time()
-                elapsed = now - start
-                if now - last_ue >= ue_interval:
-                    await send_user_event(ws, channel_id, ls_id, session)
+                if now - last_ping >= 20:
+                    try:
+                        await ws.send(json.dumps({"type": "ping"}))
+                        last_ping = now
+                        try: await asyncio.wait_for(ws.recv(), timeout=3)
+                        except: pass
+                    except: pass
+                if now - last_ue >= 60:
+                    await send_user_event(ws, channel_id, livestream_id)
                     ev_count += 1
                     last_ue = now
-                    ue_interval = random.randint(45, 65)
                     remaining = int(self.target_seconds - elapsed)
                     log(f"[SW] event #{ev_count} @{username} ({remaining}s left)")
                 if now - last_refresh >= 300:
@@ -1793,7 +1440,6 @@ class StreamWatcher:
                             if info["livestream_id"] != livestream_id:
                                 livestream_id = info["livestream_id"]
                                 self.livestream_id = livestream_id
-                                ls_id = livestream_id
                                 log(f"[SW] Updated livestream_id={livestream_id} for @{username}")
                     except: pass
                 if ev_count % 5 == 0:
@@ -1801,232 +1447,9 @@ class StreamWatcher:
                     if not info or not info.get("is_live"):
                         log(f"[SW] @{username} offline")
                         return
-        finally:
-            if session:
-                try: await session.close()
-                except: pass
                 await asyncio.sleep(1)
 
 pw = ParallelWatcher()
-
-# ============================================================
-#  SLOTS WATCHER (Admin /watchnow)
-# ============================================================
-class SlotsWatcher:
-    """Admin command: Watch all Slots & Casino streamers continuously.
-    - Max 10 at a time
-    - Each for 2-3 minutes (random)
-    - Cycles through all live streamers
-    - Stops only with /watchstop"""
-    
-    def __init__(self):
-        self.active = False
-        self.stop_event = threading.Event()
-        self.main_thread = None
-        self.watching = {}  # username -> {thread, stop_event, started_at}
-        self._lock = threading.Lock()
-        self.total_watched = 0
-        self.total_claims = 0
-    
-    def start(self, chat_id=None):
-        if self.active:
-            return False, "Already running! /watchstop to stop."
-        self.active = True
-        self.stop_event.clear()
-        self.total_watched = 0
-        self.total_claims = 0
-        self.main_thread = threading.Thread(target=self._run, args=(chat_id,), daemon=True)
-        self.main_thread.start()
-        log("[SW] Slots Watcher started")
-        return True, "<b>🎰 SLOTS WATCHER STARTED!</b>\n\nWatching all live Slots & Casino streamers.\nMax 10 at a time, 2-3 min each.\n/watchstop to stop."
-    
-    def stop(self):
-        if not self.active:
-            return False, "Not running!"
-        self.active = False
-        self.stop_event.set()
-        with self._lock:
-            for username, info in self.watching.items():
-                info["stop_event"].set()
-            self.watching.clear()
-        msg = (f"<b>🎰 SLOTS WATCHER STOPPED!</b>\n\n"
-               f"Watched: {self.total_watched}\n"
-               f"Claims: {self.total_claims}")
-        log(f"[SW] Stopped. Watched: {self.total_watched}, Claims: {self.total_claims}")
-        return True, msg
-    
-    def get_status(self):
-        if not self.active:
-            return "<b>SLOTS WATCHER: IDLE</b>\n\nUse /watchnow to start."
-        with self._lock:
-            watching = list(self.watching.keys())
-        return (f"<b>SLOTS WATCHER: ACTIVE</b>\n\n"
-                f"Watching ({len(watching)}):\n" +
-                "\n".join([f"  @{u}" for u in watching[:10]]) +
-                f"\n\nTotal watched: {self.total_watched}\n"
-                f"Claims: {self.total_claims}\n"
-                f"/watchstop to stop")
-    
-    def _run(self, chat_id):
-        """Main loop: fetch slots streamers, watch max10, repeat."""
-        while self.active and not self.stop_event.is_set():
-            try:
-                # Get live Slots & Casino streamers
-                streamers = get_slots_streamers()
-                if not streamers:
-                    log("[SW] No Slots & Casino streamers found, waiting 30s...")
-                    self._wait(30)
-                    continue
-                
-                log(f"[SW] Found {len(streamers)} Slots & Casino streamers")
-                
-                # Filter out already watching
-                to_watch = []
-                for s in streamers:
-                    username = s.get("username")
-                    if username and username not in self.watching:
-                        to_watch.append(s)
-                
-                if not to_watch:
-                    log("[SW] All already watching, waiting 30s...")
-                    self._wait(30)
-                    continue
-                
-                # Start watching max10 at a time
-                batch = to_watch[:10]
-                for s in batch:
-                    if self.stop_event.is_set():
-                        break
-                    username = s["username"]
-                    cid = s.get("channel_id")
-                    lsid = s.get("livestream_id")
-                    
-                    # Random watch time: 2-3 minutes
-                    watch_seconds = random.randint(120, 180)
-                    
-                    stop_evt = threading.Event()
-                    t = threading.Thread(
-                        target=self._watch_one,
-                        args=(username, cid, lsid, watch_seconds, stop_evt),
-                        daemon=True
-                    )
-                    
-                    with self._lock:
-                        self.watching[username] = {
-                            "stop_event": stop_evt,
-                            "started_at": time.time(),
-                            "watch_seconds": watch_seconds,
-                        }
-                    
-                    t.start()
-                    self.total_watched += 1
-                    log(f"[SW] Watching @{username} for {watch_seconds}s")
-                    time.sleep(0.5)  # Stagger connections
-                
-                if chat_id:
-                    tg_send(f"<b>🎰 Batch:</b> Watching {len(batch)} streamers ({', '.join(['@'+s['username'] for s in batch[:5]])}{'...' if len(batch)>5 else ''})", chat_id=chat_id)
-                
-                # Wait for batch to finish (check every 10s)
-                self._wait(10)
-                
-            except Exception as e:
-                log(f"[SW] Error: {e}")
-                self._wait(10)
-        
-        log("[SW] Slots Watcher stopped")
-    
-    def _watch_one(self, username, channel_id, livestream_id, target_seconds, stop_event):
-        """Watch a single streamer for target_seconds."""
-        try:
-            # Wait for our turn (stagger starts)
-            self._wait(random.randint(1, 5))
-            if stop_event.is_set(): return
-            
-            # Connect via WebSocket
-            ws_token = get_ws_token(get_cookie())
-            if not ws_token:
-                log(f"[SW] No WS token for @{username}")
-                return
-            
-            ws_url = WS_URL_TEMPLATE.format(token=ws_token)
-            headers = dict(BASE_HEADERS)
-            headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
-            
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self._ws_loop(ws_url, headers, username, channel_id, livestream_id, stop_event, target_seconds))
-            finally:
-                loop.close()
-            
-        except Exception as e:
-            log(f"[SW] Error @{username}: {e}")
-        finally:
-            with self._lock:
-                self.watching.pop(username, None)
-            log(f"[SW] Done @{username}")
-    
-    async def _ws_loop(self, ws_url, headers, username, channel_id, livestream_id, stop_event, target_seconds):
-        """WebSocket loop using curl_cffi (Chrome TLS) + kickautodrops pattern."""
-        ls_id = livestream_id or channel_id
-        ws, session = await curl_ws_connect(ws_url, headers)
-        
-        try:
-            # Initial handshake
-            await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-            await curl_ws_recv(ws, session, timeout=3)
-            log(f"[SW] Connected @{username}")
-            
-            start = time.time()
-            last_ue = time.time()
-            ue_interval = random.randint(45, 65)
-            counter = 0
-            
-            while not stop_event.is_set():
-                now = time.time()
-                elapsed = now - start
-                
-                if elapsed >= target_seconds:
-                    log(f"[SW] @{username} done ({int(elapsed)}s)")
-                    return
-                
-                # Alternate ping/channel_handshake every 13-18s
-                counter += 1
-                if counter % 2 == 0:
-                    await curl_ws_send(ws, json.dumps({"type": "ping"}), session)
-                else:
-                    await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-                
-                await curl_ws_recv(ws, session, timeout=1.0)
-                await asyncio.sleep(random.randint(13, 18))
-                
-                # user_event every 60s
-                now = time.time()
-                elapsed = now - start
-                if now - last_ue >= ue_interval:
-                    await send_user_event(ws, channel_id, ls_id, session)
-                    last_ue = now
-                    ue_interval = random.randint(45, 65)
-                    remaining = int(target_seconds - elapsed)
-                    log(f"[SW] @{username} event ({remaining}s left)")
-                    if elapsed >= 60:
-                        try:
-                            smart_claim_check(username)
-                        except: pass
-        finally:
-            if session:
-                try: await session.close()
-                except: pass
-                
-                await asyncio.sleep(1)
-    
-    def _wait(self, seconds):
-        """Wait, checking stop_event periodically."""
-        end = time.time() + seconds
-        while time.time() < end and not self.stop_event.is_set():
-            time.sleep(1)
-
-slots_watcher = SlotsWatcher()
 
 # ============================================================
 #  DASHBOARD (Password Protected)
@@ -2051,14 +1474,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"<h1>401 Unauthorized</h1><p>Admin access only.</p>")
 
     def do_GET(self):
-        # HEALTH CHECK - no auth required, responds instantly
+        # /health - NO AUTH REQUIRED (for Render keepalive)
         if self.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"OK")
             return
-
+        
         if not self._check_auth():
             self._send_auth_required()
             return
@@ -2069,11 +1492,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         state = load_state()
         known = state.get("known", {})
+        subs = load_subs()
+        active = sum(1 for s in subs.values() if s.get("active", True))
         # Get poll count from DropHunter's in-memory state (more accurate)
         poll_count = drop_hunter.state.get('polls', 0)
         last_poll = drop_hunter.state.get('last_poll', None)
-        subs = load_subs()
-        active = sum(1 for s in subs.values() if s.get("active", True))
         rows = ""
         for sid, d in subs.items():
             st = "Active" if d.get("active", True) else "Inactive"
@@ -2091,8 +1514,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pw_c = "#4CAF50" if pw.active else "#999"
         watching = pw.state.get("watching", {})
         w_list = ", ".join([f"@{u}" for u in watching]) or "None"
-        sw_s = "ACTIVE" if any(sw.active for sw in single_watchers.values()) else "IDLE"
-        sw_users = ", ".join([f"@{u}" for sw in single_watchers.values() for u in sw.watchers.keys()]) or "None"
+        sw_s = "ACTIVE" if single_watcher.active else "IDLE"
+        sw_users = ", ".join([f"@{u}" for u in single_watcher.watchers.keys()]) or "None"
         dh_s = "ACTIVE" if drop_hunter.active else "STOPPED"
         dh_c = "#4CAF50" if drop_hunter.active else "#999"
         dh_watching = len(drop_hunter.watching_channels)
@@ -2154,6 +1577,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 # ---- Commands ----
 def handle_command(cmd, chat_id, text="", username=None, first_name=None):
+    vlog("CMD", f"Command: {cmd} | chat_id={chat_id} | user=@{username or '?'} | text='{text[:50]}'")
     is_new = add_sub(chat_id, username=username, first_name=first_name)
 
     if cmd in ("/start", "/help"):
@@ -2162,7 +1586,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             name_display = f" ({first_name})" if first_name else ""
             tg_send_admin(f"<b>NEW USER!</b>\n{display}{name_display}\nTotal: {len(get_active_subs())}")
         tg_send(
-            "<b>Kick Drops Bot v26</b>\n\n"
+            "<b>Kick Drops Bot v20</b>\n\n"
             "<b>DROP HUNTER (auto):</b>\n"
             "/dh - Drop Hunter status\n"
             "/dhretry - Claim retry queue\n\n"
@@ -2180,21 +1604,15 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             "/stake - Stake campaigns\n"
             "/live - Live streams\n"
             "/history - Drop history\n"
-            "/status - Bot status\n"
-            "/stats - Detailed statistics\n"
-            "/ping - Check bot responsiveness\n"
-            "/uptime - Bot uptime\n\n"
+            "/status - Bot status\n\n"
             "<b>MANUAL WATCH:</b>\n"
             "/watchtest &lt;user1&gt; [user2] - Watch streams\n"
-            "/watchstop - Stop all watchers\n"
+            "/watchstop - Stop\n"
             "/watchstatus - Watch info\n"
-            "/watchnow - Admin: watch Slots &amp; Casino 24/7\n"
             "/startwatching - Test: watch all known live (1 hour)\n\n"
             "<b>CONFIG:</b>\n"
-            "/setcookie - Set your personal cookie\n"
+            "/setcookie - Update cookie\n"
             "/checkcookie - Check if cookie is valid\n"
-            "/mycookie - Admin: see admin cookie\n"
-            "/removecookie - Admin: remove all user cookies\n"
             "/stop - Unsubscribe\n"
             "/help - This",
             chat_id=chat_id)
@@ -2236,7 +1654,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         for i in range(0, len(msg), 4000): tg_send(msg[i:i+4000], chat_id=chat_id)
 
     elif cmd == "/stake":
-        campaigns, _ = fetch_campaigns(user_id=chat_id)
+        campaigns, _ = fetch_campaigns()
         if not campaigns: tg_send("API unavailable.", chat_id=chat_id); return
         stake = [c for c in campaigns if is_stake_drop(c)]
         if not stake: tg_send(f"No Stake drops. Total: {len(campaigns)}", chat_id=chat_id); return
@@ -2247,7 +1665,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
     elif cmd == "/live":
         tg_send("Checking...", chat_id=chat_id)
         try:
-            data = kick_request("https://web.kick.com/api/v1/livestreams?limit=100&sort=viewer_count", user_id=chat_id)
+            data = kick_request("https://web.kick.com/api/v1/livestreams?limit=100&sort=viewer_count")
             streams = data.get("data", [])
             live_stake = []
             for s in streams:
@@ -2281,124 +1699,72 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
 
     elif cmd == "/status":
         polls = drop_hunter.state.get('polls', 0)
-        tg_send(f"Polls: {polls}\nDrops: {len(drop_hunter.known_campaigns)}\nWatching: {len(drop_hunter.watching_channels)}\nSubs: {len(get_active_subs())}\nDH: {'ON' if drop_hunter.active else 'OFF'}\nPW: {'ON' if pw.active else 'OFF'}\nSW: {'ON' if any(sw.active for sw in single_watchers.values()) else 'OFF'}", chat_id=chat_id)
+        tg_send(f"Polls: {polls}\nDrops: {len(drop_hunter.known_campaigns)}\nWatching: {len(drop_hunter.watching_channels)}\nSubs: {len(get_active_subs())}\nDH: {'ON' if drop_hunter.active else 'OFF'}\nPW: {'ON' if pw.active else 'OFF'}\nSW: {'ON' if single_watcher.active else 'OFF'}", chat_id=chat_id)
 
     elif cmd == "/setcookie":
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            tg_send("Usage: /setcookie &lt;cookie&gt;\n\nPaste your Kick cookie here.\nBot will validate and fetch your username.", chat_id=chat_id)
+            vlog("CMD", f"/setcookie: No cookie provided by user {chat_id}")
+            tg_send("Usage: /setcookie &lt;cookie&gt;\n\nKick se cookie paste karo.\nBot validate karega aur tumhara username fetch karega.", chat_id=chat_id)
             return
         
         raw_cookie = parts[1].strip()
+        vlog("CMD", f"/setcookie: Raw cookie length={len(raw_cookie)}, first20='{raw_cookie[:20]}...'")
         # Always decode cookie (if URL-encoded %7C → |)
         try:
-            cookie = _urlparse.unquote(raw_cookie)
+            import urllib.parse
+            cookie = urllib.parse.unquote(raw_cookie)
+            vlog("CMD", f"/setcookie: Decoded length={len(cookie)}")
         except:
             cookie = raw_cookie
         tg_send("Validating cookie...", chat_id=chat_id)
         
         # Validate cookie and get user info
+        vlog("CMD", f"/setcookie: Validating cookie...")
         valid, username, user_id = validate_cookie_and_get_user(cookie)
+        vlog("CMD", f"/setcookie: Validation result: valid={valid}, username={username}, user_id={user_id}")
         
         if valid:
-            # Save ONLY as per-user cookie (NEVER overwrite global admin cookie)
+            # Save per-user cookie
+            vlog("CMD", f"/setcookie: Saving to Supabase for user {chat_id}")
             if USE_SUPABASE:
-                print(f"[SETCOOKIE] Saving cookie for user {chat_id}: len={len(cookie)}, preview={cookie[:15]}...{cookie[-5:] if len(cookie) > 20 else cookie}")
                 db.save_user_cookie(chat_id, cookie, username or "unknown", user_id or 0)
-            else:
-                # Fallback: save to local file only
-                save_cookie(cookie)
+            
+            # Also save as global fallback
+            vlog("CMD", f"/setcookie: Saving as global fallback")
+            save_cookie(cookie)
             
             msg = (f"<b>Cookie Saved!</b>\n\n"
                    f"<b>Status:</b> VALID\n"
-                   f"<b>Kick User:</b> @{username}\n"
+                   f"<b>Followed:</b> {username}\n"
                    f"<b>Your TG ID:</b> {chat_id}\n\n"
-                   f"This cookie is linked to YOUR account only.\n"
-                   f"Bot will use it for claiming drops on your behalf.")
+                   f"Ab tumhare liye yeh cookie use hogi.\n"
+                   f"Bot automatically drops claim karega.")
             tg_send(msg, chat_id=chat_id)
             tg_send_admin(f"<b>NEW COOKIE SET!</b>\nFollowed: {username}\nTG: {chat_id}")
         else:
-            # Invalid cookie - do NOT save anywhere
-            tg_send("Cookie is INVALID or EXPIRED!\nPlease check your cookie and try again with /setcookie.", chat_id=chat_id)
+            # Invalid cookie - save as global fallback
+            vlog("CMD", f"/setcookie: INVALID cookie - saving as fallback anyway")
+            save_cookie(cookie)
+            tg_send("Cookie saved (validation failed - using as global fallback).\nAgar yeh cookie valid hai toh baad mein kaam karegi.", chat_id=chat_id)
 
     elif cmd == "/checkcookie":
-        cookie = get_cookie(chat_id)
+        global COOKIE_VALIDATED
+        vlog("CMD", f"/checkcookie: Checking cookie for user {chat_id}")
+        cookie = get_cookie()
         if not cookie:
+            vlog("CMD", f"/checkcookie: No cookie found!")
             tg_send("<b>🔴 No cookie found!</b>\nUse /setcookie to add one.", chat_id=chat_id)
             return
+        vlog("CMD", f"/checkcookie: Cookie found: {len(cookie)} chars")
         valid, username, user_id = validate_cookie_and_get_user(cookie)
-        source = "YOUR OWN"
-        if chat_id == ADMIN_ID:
-            source = "ADMIN"
+        vlog("CMD", f"/checkcookie: Result: valid={valid}, username={username}, user_id={user_id}")
         if valid:
-            tg_send(f"<b>✅ Cookie VALID!</b>\n\n<b>Kick User:</b> @{username}\n<b>User ID:</b> {user_id}\n<b>Source:</b> {source}\n<b>Cookie length:</b> {len(cookie)} chars", chat_id=chat_id)
+            COOKIE_VALIDATED = True
+            tg_send(f"<b>✅ Cookie VALID!</b>\n\n<b>Kick User:</b> @{username}\n<b>User ID:</b> {user_id}\n<b>Cookie length:</b> {len(cookie)} chars", chat_id=chat_id)
         else:
+            COOKIE_VALIDATED = False
             tg_send(f"<b>🔴 Cookie INVALID/EXPIRED!</b>\n\nUse /setcookie with a fresh cookie.\n\n<i>How to get cookie:</i>\n1. Open kick.com in browser\n2. Login to your account\n3. Press F12 → Application → Cookies\n4. Copy the 'session' cookie value", chat_id=chat_id)
-
-    elif cmd == "/mycookie":
-        # Admin-only: show current cookie info
-        if chat_id != ADMIN_ID:
-            tg_send("⛔ Admin only command.", chat_id=chat_id)
-            return
-        
-        # FIX: Use admin OWN cookie (pass chat_id) not global
-        cookie = get_cookie(chat_id)
-        if not cookie:
-            tg_send("<b>🔴 NO COOKIE SET!</b>\n\nUse /setcookie to add one.", chat_id=chat_id)
-            return
-        
-        # Determine source - simple: user cookie OR env var
-        source = "🌐 ENV VAR (KICK_COOKIE)"
-        if USE_SUPABASE:
-            try:
-                user_data = db.get_user_cookie(ADMIN_ID)
-                if user_data and user_data.get("cookie") and _urlparse.unquote(user_data["cookie"]) == cookie:
-                    source = "👤 YOUR COOKIE (/setcookie)"
-            except: pass
-        
-        # Count user cookies
-        user_count = 0
-        if USE_SUPABASE:
-            try:
-                all_uc = db.get_all_user_cookies()
-                user_count = len(all_uc) if all_uc else 0
-            except: pass
-        
-        # Validate
-        valid, username, user_id = validate_cookie_and_get_user(cookie)
-        status = "✅ VALID" if valid else "❌ INVALID/EXPIRED"
-        kick_user = f"@{username}" if username and valid else "N/A"
-        
-        # Mask cookie (show first 10 + last 5 chars)
-        masked = cookie[:10] + "..." + cookie[-5:] if len(cookie) > 15 else cookie[:5] + "..."
-        
-        msg = (f"<b>🔑 ADMIN COOKIE STATUS</b>\n\n"
-               f"<b>Source:</b> {source}\n"
-               f"<b>Status:</b> {status}\n"
-               f"<b>Kick User:</b> {kick_user}\n"
-               f"<b>Length:</b> {len(cookie)} chars\n"
-               f"<b>Preview:</b> <code>{masked}</code>\n\n"
-               f"<b>Users with own cookie:</b> {user_count}\n"
-               f"<i>Everyone without personal cookie uses this</i>")
-        tg_send(msg, chat_id=chat_id)
-
-    elif cmd == "/removecookie":
-        # Admin-only: remove ALL user cookies (everyone falls back to admin cookie)
-        if chat_id != ADMIN_ID:
-            tg_send("⛔ Admin only command.", chat_id=chat_id)
-            return
-        if not USE_SUPABASE:
-            tg_send("Supabase not available. Cannot remove user cookies.", chat_id=chat_id)
-            return
-        try:
-            all_uc = db.get_all_user_cookies()
-            count = len(all_uc) if all_uc else 0
-            db.remove_all_user_cookies()
-            log(f"[ADMIN] Removed all {count} user cookies")
-            tg_send(f"<b>✅ ALL USER COOKIES REMOVED!</b>\n\nRemoved: {count} users\n\nAll users will now use the admin/global cookie.", chat_id=chat_id)
-        except Exception as e:
-            log(f"[ADMIN] removecookie error: {e}")
-            tg_send(f"Error removing cookies: {e}", chat_id=chat_id)
 
     elif cmd == "/addchannel":
         parts = text.split()
@@ -2457,31 +1823,15 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             tg_send("Usage: /watchtest &lt;user1&gt; [user2] [user3]...\nExample: /watchtest stake casinoen", chat_id=chat_id)
             return
         usernames = [p.strip("@") for p in parts[1:] if p.strip("@")]
-        success, msg = get_single_watcher(chat_id).start(chat_id, usernames)
+        success, msg = single_watcher.start(chat_id, usernames)
         tg_send(msg, chat_id=chat_id)
 
     elif cmd == "/watchstop":
-        # Stop both SingleWatcher and SlotsWatcher
-        msgs = []
-        s, m = get_single_watcher(chat_id).stop(reason="user stopped")
-        if s: msgs.append(m)
-        s, m = slots_watcher.stop()
-        if s: msgs.append(m)
-        if not msgs:
-            msgs.append("Nothing to stop.")
-        tg_send("\n\n".join(msgs), chat_id=chat_id)
-
-    elif cmd == "/watchnow":
-        # Admin only: watch all Slots & Casino streamers
-        if chat_id != ADMIN_ID:
-            tg_send("⛔ Admin only command.", chat_id=chat_id)
-            return
-        success, msg = slots_watcher.start(chat_id=chat_id)
+        success, msg = single_watcher.stop(reason="user stopped")
         tg_send(msg, chat_id=chat_id)
 
     elif cmd == "/watchstatus":
-        msg = get_single_watcher(chat_id).get_status() + "\n\n" + slots_watcher.get_status()
-        tg_send(msg, chat_id=chat_id)
+        tg_send(single_watcher.get_status(), chat_id=chat_id)
 
     elif cmd == "/startwatching":
         # Test command: watch all known live streamers for 1 hour
@@ -2534,7 +1884,7 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
     elif cmd == "/addstreamer":
         parts = text.split()
         if len(parts) < 2:
-            tg_send("Usage: /addstreamer &lt;username&gt;\n\nAdd your favorite streamer.\nBot will watch them as long as they are live and you do not stop it.", chat_id=chat_id)
+            tg_send("Usage: /addstreamer &lt;username&gt;\n\nApne manpasand streamer add karo.\nJab tak woh live hai aur tum band na karo, bot watch karega.", chat_id=chat_id)
             return
         username = parts[1].strip("@").strip()
         if USE_SUPABASE:
@@ -2583,129 +1933,6 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
             db.remove_user_preference(chat_id, ch)
         tg_send(f"Cleared {len(prefs)} streamers from your list.", chat_id=chat_id)
 
-    # ---- Admin Commands ----
-    elif cmd == "/broadcast":
-        # Admin only: broadcast message to all users
-        if chat_id != ADMIN_ID:
-            tg_send("<b>Admin only command.</b>", chat_id=chat_id)
-            return
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            tg_send("Usage: /broadcast &lt;message&gt;\n\nSends your message to all subscribed users.", chat_id=chat_id)
-            return
-        message = parts[1]
-        # HTML-escape the user's message to prevent parse errors
-        def _html_escape(s):
-            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        safe_message = _html_escape(message)
-        subs = get_active_subs()
-        if not subs:
-            tg_send("No subscribers to broadcast to.", chat_id=chat_id)
-            return
-        # Add admin signature
-        broadcast_msg = f"<b>📢 Message from Admin:</b>\n\n{safe_message}\n\n<i>Sent to {len(subs)} users</i>"
-        sent_count = 0
-        failed_count = 0
-        import urllib.request as _urllib_req
-        import urllib.error as _urllib_err
-        for uid in subs:
-            try:
-                payload = json.dumps({"chat_id": uid, "text": broadcast_msg, "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
-                req = _urllib_req.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data=payload, method="POST")
-                req.add_header("Content-Type", "application/json")
-                _urllib_req.urlopen(req, timeout=15)
-                sent_count += 1
-                time.sleep(0.1)  # Rate limit protection - 100ms between sends
-            except _urllib_err.HTTPError as e:
-                failed_count += 1
-                log(f"[BROADCAST] Failed for {uid}: HTTP {e.code}")
-            except Exception as e:
-                failed_count += 1
-                log(f"[BROADCAST] Failed for {uid}: {e}")
-        log(f"[BROADCAST] Sent to {sent_count}/{len(subs)} users (failed: {failed_count})")
-        tg_send(f"<b>Broadcast Complete!</b>\n\nSent: {sent_count}\nFailed: {failed_count}\nTotal: {len(subs)}", chat_id=chat_id)
-
-    elif cmd == "/stats":
-        # Detailed bot statistics
-        subs = load_subs()
-        active_subs = get_active_subs()
-        state = load_state()
-        history = load_history()
-        watchlist = get_watchlist()
-        
-        # Watcher stats
-        sw_watching = len(slots_watcher.watching) if slots_watcher.active else 0
-        pw_watching = len(pw.watchers) if pw.active else 0
-        single_watching = sum(len(sw.watchers) for sw in single_watchers.values())
-        total_watching = sw_watching + pw_watching + single_watching
-        
-        # Drop stats
-        known_channels = len(drop_hunter.known_all_channels)
-        total_polls = drop_hunter.state.get("polls", 0)
-        claimed = len(drop_hunter.claimed_rewards)
-        history_count = len(history)
-        
-        # Cookie status
-        cookie = get_cookie()
-        cookie_status = "SET" if cookie else "NOT SET"
-        
-        # Slots streamers
-        slots_streamers = get_slots_streamers()
-        
-        msg = (f"<b>STATISTICS</b>\n"
-                f"{'=' * 25}\n\n"
-                f"<b>Users:</b>\n"
-                f"  Active: {len(active_subs)}\n"
-                f"  Total: {len(subs)}\n\n"
-                f"<b>Watchers:</b>\n"
-                f"  Slots &amp; Casino: {sw_watching} {'ACTIVE' if slots_watcher.active else 'IDLE'}\n"
-                f"  Parallel: {pw_watching} {'ACTIVE' if pw.active else 'IDLE'}\n"
-                f"  Single: {single_watching} {'ACTIVE' if any(sw.active for sw in single_watchers.values()) else 'IDLE'}\n"
-                f"  Total watching: {total_watching}\n\n"
-                f"<b>Drops:</b>\n"
-                f"  Known channels: {known_channels}\n"
-                f"  Total polls: {total_polls}\n"
-                f"  Claimed rewards: {claimed}\n"
-                f"  History entries: {history_count}\n\n"
-                f"<b>Watchlist:</b>\n"
-                f"  Channels: {len(watchlist)}\n\n"
-                f"<b>Slots &amp; Casino:</b>\n"
-                f"  Live streamers: {len(slots_streamers)}\n"
-                f"  Cookie: {cookie_status}\n"
-                f"  Uptime: {fmt_duration(time.time() - BOT_START_TIME)}")
-        tg_send(msg, chat_id=chat_id)
-
-    elif cmd == "/uptime":
-        uptime = time.time() - BOT_START_TIME
-        days = int(uptime // 86400)
-        hours = int((uptime % 86400) // 3600)
-        mins = int((uptime % 3600) // 60)
-        tg_send(f"<b>Bot Uptime:</b>\n\n{days}d {hours}h {mins}m\n\nStarted: {datetime.fromtimestamp(BOT_START_TIME).strftime('%Y-%m-%d %H:%M')}", chat_id=chat_id)
-
-    elif cmd == "/users":
-        # Admin only: list all subscribers
-        if chat_id != ADMIN_ID:
-            tg_send("<b>Admin only command.</b>", chat_id=chat_id)
-            return
-        subs = load_subs()
-        if not subs:
-            tg_send("No subscribers.", chat_id=chat_id)
-            return
-        msg = f"<b>USERS ({len(subs)}):</b>\n\n"
-        for sid, data in subs.items():
-            status = "Active" if data.get("active", True) else "Inactive"
-            username = data.get("username", "?")
-            first_name = data.get("first_name", "?")
-            added = data.get("added_at", "?")[:10]
-            msg += f"  @{username} ({first_name})\n    ID: {sid} | {status} | {added}\n"
-        tg_send(msg, chat_id=chat_id)
-
-    elif cmd == "/ping":
-        start = time.time()
-        tg_send("Pong! Bot is responsive.", chat_id=chat_id)
-        elapsed = (time.time() - start) * 1000
-        log(f"[PING] Response time: {elapsed:.0f}ms")
-
 def _test_watch_loop(slug, channel_id, livestream_id, stop_event, duration_secs):
     """Test watch loop - watches for specified duration then stops."""
     start_time = time.time()
@@ -2735,7 +1962,6 @@ def _test_watch_loop(slug, channel_id, livestream_id, stop_event, duration_secs)
             
             ws_url = WS_URL_TEMPLATE.format(token=ws_token)
             headers = dict(BASE_HEADERS)
-            headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
             
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -2755,23 +1981,21 @@ def _test_watch_loop(slug, channel_id, livestream_id, stop_event, duration_secs)
     log(f"[TEST] Stopped watching @{slug} ({events_sent} events sent)")
 
 async def _test_ws_loop(ws_url, headers, slug, channel_id, livestream_id, stop_event, duration_secs, start_time):
-    """WS loop for test watching using curl_cffi + kickautodrops pattern."""
+    """WS loop for test watching."""
     ls_id = livestream_id or channel_id
-    ws, session = await curl_ws_connect(ws_url, headers)
     
-    try:
-        await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-        await curl_ws_recv(ws, session, timeout=3)
-        await send_user_event(ws, channel_id, ls_id, session)
+    async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+        await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
+        try: await asyncio.wait_for(ws.recv(), timeout=5)
+        except: pass
+        await send_user_event(ws, channel_id, ls_id)
         log(f"[TEST] Connected @{slug} channel_id={channel_id}")
         
         last_ue = time.time()
+        last_ping = time.time()
         events_sent = 1
-        ue_interval = random.randint(45, 65)
-        counter = 0
         
         while not stop_event.is_set():
-            counter += 1
             now = time.time()
             elapsed = now - start_time
             
@@ -2779,27 +2003,20 @@ async def _test_ws_loop(ws_url, headers, slug, channel_id, livestream_id, stop_e
                 log(f"[TEST] @{slug} - time up")
                 return
             
-            if counter % 2 == 0:
-                await curl_ws_send(ws, json.dumps({"type": "ping"}), session)
-            else:
-                await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
+            if now - last_ping >= 20:
+                try:
+                    await ws.send(json.dumps({"type": "ping"}))
+                    last_ping = now
+                    try: await asyncio.wait_for(ws.recv(), timeout=3)
+                    except: pass
+                except: pass
             
-            await curl_ws_recv(ws, session, timeout=1.0)
-            await asyncio.sleep(random.randint(13, 18))
-            
-            now = time.time()
-            elapsed = now - start_time
-            if now - last_ue >= ue_interval:
-                await send_user_event(ws, channel_id, ls_id, session)
+            if now - last_ue >= 60:
+                await send_user_event(ws, channel_id, ls_id)
                 events_sent += 1
                 last_ue = now
-                ue_interval = random.randint(45, 65)
                 remaining = int(duration_secs - elapsed)
                 log(f"[TEST] @{slug} event #{events_sent} ({remaining//60}m left)")
-    finally:
-        if session:
-            try: await session.close()
-            except: pass
             
             await asyncio.sleep(1)
 
@@ -2825,9 +2042,8 @@ class DropHunter:
         self.claim_retry_queue = {}  # claim_key -> {campaign_id, reward_id, slug, retries, next_retry, last_progress}
         self.failed_rewards = set()  # permanently failed - don't re-add to retry queue
         self.known_stake_campaigns = set()  # IDs of confirmed Stake drops only
+        self.state = {"polls": 0, "last_poll": None}
         self._lock = threading.Lock()
-        # State tracking for dashboard
-        self.state = {"polls": 0, "last_poll": None, "known": {}}
     
     def start(self):
         if self.active: return
@@ -2963,6 +2179,7 @@ class DropHunter:
         # Step 3: Continuous polling loop - ALWAYS POLL for notifications
         # Watching (WS connections) only during active hours
         was_active = self._is_active_hours()
+        consecutive_errors = 0
         while self.active:
             try:
                 is_now_active = self._is_active_hours()
@@ -2985,27 +2202,41 @@ class DropHunter:
                 
                 # ALWAYS poll for drops, notifications, claims (24/7)
                 self._poll_and_watch()
+                consecutive_errors = 0  # Reset on success
             except Exception as e:
-                log(f"[DH] Error: {e}")
+                consecutive_errors += 1
+                log(f"[DH] Error #{consecutive_errors}: {type(e).__name__}: {str(e)[:100]}")
+                if consecutive_errors > 10:
+                    log(f"[DH] Too many errors ({consecutive_errors}), waiting 30s before retry")
+                    time.sleep(30)
+                    consecutive_errors = 0
+                else:
+                    time.sleep(2)  # Brief pause on error
             time.sleep(POLL_INTERVAL)  # 5s always — 24/7 polling
     
     def _discover_all_channels(self):
         """Discover ALL channels from campaigns + watchlist + user preferences."""
+        vlog("DH-DISCOVER", "Starting channel discovery...")
         try:
             # Source 1: From API (current campaigns)
-            campaigns, _ = fetch_campaigns()
+            vlog("DH-DISCOVER", "Source 1: Fetching campaigns...")
+            campaigns, cookie_ok = fetch_campaigns()
             if campaigns:
                 for c in campaigns:
                     for ch in c.get("channels", []):
                         slug = ch.get("slug") or (ch.get("user") or {}).get("username", "")
                         if slug and slug not in self.known_all_channels:
                             self.known_all_channels.add(slug)
+                vlog("DH-DISCOVER", f"From campaigns: {len(self.known_all_channels)} channels so far")
+            else:
+                vlog("DH-DISCOVER", f"No campaigns (cookie_ok={cookie_ok})")
             
             # Source 2: From persistent watchlist (manual)
-            watchlist = get_watchlist() or []
-            for slug in (watchlist or []):
-                if slug and slug not in self.known_all_channels:
+            watchlist = get_watchlist()
+            for slug in watchlist:
+                if slug not in self.known_all_channels:
                     self.known_all_channels.add(slug)
+            vlog("DH-DISCOVER", f"From watchlist: {len(watchlist)} channels")
             
             # Source 3: From followed channels
             try:
@@ -3013,7 +2244,9 @@ class DropHunter:
                 for slug in followed:
                     if slug not in self.known_all_channels:
                         self.known_all_channels.add(slug)
-            except: pass
+                vlog("DH-DISCOVER", f"From followed: {len(followed)} channels")
+            except Exception as e:
+                vlog("DH-DISCOVER", f"Followed error: {e}")
             
             # Source 4: From user preferences (custom streamers)
             self.user_pref_channels = set()
@@ -3029,9 +2262,11 @@ class DropHunter:
                 except Exception as e:
                     log(f"[DH] User prefs load error: {e}")
             
+            vlog("DH-DISCOVER", f"FINAL: {len(self.known_all_channels)} total channels (watchlist={len(watchlist)}, user_prefs={len(self.user_pref_channels)})")
             log(f"[DH] Total known: {len(self.known_all_channels)} (watchlist: {len(watchlist)}, user_prefs: {len(self.user_pref_channels)})")
             
         except Exception as e:
+            vlog("DH-DISCOVER", f"ERROR: {type(e).__name__}: {str(e)[:100]}")
             log(f"[DH] Discover error: {e}")
     
     def _start_watching_all_known(self):
@@ -3059,16 +2294,21 @@ class DropHunter:
         - is_manual: No time limit
         - is_user_pref: No limit (until stopped/offline)
         - Default: 30 min limit, only during active hours (4AM-10AM IST)"""
-        if slug in self.watching_channels: return
+        vlog("DH", f"_start_watching_channel(@{slug}, manual={is_manual}, pref={is_user_pref})")
+        if slug in self.watching_channels:
+            vlog("DH", f"@{slug} already watching - SKIP")
+            return
         
         # Get channel info
         info = get_channel_info(slug)
         if not info or not info.get("is_live"):
+            vlog("DH", f"@{slug} offline or not found - SKIP")
             log(f"[DH] @{slug} offline, will retry when live")
             return
         
         cid = channel_id or info.get("channel_id")
         lsid = info.get("livestream_id")
+        vlog("DH", f"@{slug}: channel_id={cid}, livestream_id={lsid}")
         
         stop_event = threading.Event()
         
@@ -3099,11 +2339,13 @@ class DropHunter:
         - User preferences: No limit (until stopped/offline)
         - Manual: No limit"""
         start_time = time.time()
+        vlog("DH-WATCH", f"@{slug}: Watch loop started (manual={is_manual}, pref={is_user_pref})")
         
         while not stop_event.is_set():
             # Check time limit (only for Stake list)
             elapsed = time.time() - start_time
             if not is_manual and not is_user_pref and elapsed >= AUTO_WATCH_LIMIT:
+                vlog("DH-WATCH", f"@{slug}: 30min limit reached")
                 log(f"[DH] @{slug} 30min limit reached, stopping")
                 break
             
@@ -3112,19 +2354,22 @@ class DropHunter:
                 try:
                     info = get_channel_info(slug)
                     if not info or not info.get("is_live"):
+                        vlog("DH-WATCH", f"@{slug}: Offline - stopping")
                         log(f"[DH] @{slug} offline - stopping user preference watch")
                         break
                 except: pass
             
             try:
+                vlog("DH-WATCH", f"@{slug}: Getting WS token...")
                 ws_token = get_ws_token(get_cookie())
                 if not ws_token:
+                    vlog("DH-WATCH", f"@{slug}: No WS token - retrying in 10s")
                     time.sleep(10)
                     continue
                 
                 ws_url = WS_URL_TEMPLATE.format(token=ws_token)
+                vlog("DH-WATCH", f"@{slug}: WS URL ready, connecting...")
                 headers = dict(BASE_HEADERS)
-                headers["Cookie"] = f"client_token={KICK_CLIENT_TOKEN}"
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
@@ -3132,68 +2377,66 @@ class DropHunter:
                 finally:
                     loop.close()
             except Exception as e:
+                vlog("DH-WATCH", f"@{slug}: ERROR {type(e).__name__}: {str(e)[:100]}")
                 log(f"[DH] WS error @{slug}: {e}")
             
             if not stop_event.is_set():
                 time.sleep(5)
     
     async def _ws_loop(self, ws_url, headers, slug, channel_id, livestream_id, stop_event):
-        """WS connection using curl_cffi (Chrome TLS) + kickautodrops pattern:
-        - Alternate ping/channel_handshake every 13-18s
-        - user_event every 60s
-        """
-        ls_id = livestream_id or channel_id
-        ws, session = await curl_ws_connect(ws_url, headers)
+        """WS connection: handshake + user_events every 60s"""
+        import websockets
         
-        try:
-            # Initial handshake
-            await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-            await curl_ws_recv(ws, session, timeout=3)
+        ls_id = livestream_id or channel_id
+        vlog("DH-WS", f"@{slug}: Connecting WS... channel={channel_id}, ls={ls_id}")
+        
+        async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20, ping_timeout=10) as ws:
+            vlog("DH-WS", f"@{slug}: WS connected! Sending handshake...")
+            # Handshake
+            await ws.send(json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}))
+            try: await asyncio.wait_for(ws.recv(), timeout=5)
+            except asyncio.TimeoutError: vlog("DH-WS", f"@{slug}: Handshake recv timeout (normal)")
+            except Exception as e: log(f"[DH] Handshake recv error @{slug}: {e}")
             
-            counter = 0
+            # Initial user_event
+            vlog("DH-WS", f"@{slug}: Sending initial user_event...")
+            await send_user_event(ws, channel_id, ls_id)
+            vlog("DH-WS", f"@{slug}: Initial event sent OK")
+            
             last_ue = time.time()
+            last_ping = time.time()
             last_refresh = time.time()
-            ue_interval = random.randint(45, 65)
             
             while not stop_event.is_set():
-                counter += 1
-                
-                # Alternate between ping and channel_handshake (kickautodrops pattern)
-                if counter % 2 == 0:
-                    await curl_ws_send(ws, json.dumps({"type": "ping"}), session)
-                else:
-                    await curl_ws_send(ws, json.dumps({"type": "channel_handshake", "data": {"message": {"channelId": channel_id}}}), session)
-                
-                # Wait for response
-                await curl_ws_recv(ws, session, timeout=1.0)
-                
-                # Random delay 13-18 seconds (kickautodrops pattern)
-                delay = random.randint(13, 18)
-                await asyncio.sleep(delay)
-                
-                # user_event every 60s
                 now = time.time()
-                if now - last_ue >= ue_interval:
-                    # Refresh livestream_id every 5 min
+                
+                if now - last_ping >= 20:
+                    try:
+                        await ws.send(json.dumps({"type": "ping"}))
+                        last_ping = now
+                        try: await asyncio.wait_for(ws.recv(), timeout=3)
+                        except asyncio.TimeoutError: pass
+                        except Exception as e: log(f"[DH] Ping recv error @{slug}: {e}")
+                    except Exception as e: log(f"[DH] Ping send error @{slug}: {e}")
+                
+                if now - last_ue >= 60:
+                    # Refresh livestream_id
                     if now - last_refresh >= 300:
                         last_refresh = now
                         try:
                             fresh = get_channel_info(slug)
                             if fresh and fresh.get("livestream_id"):
                                 ls_id = fresh["livestream_id"]
-                        except: pass
+                        except Exception as e: log(f"[DH] Refresh error @{slug}: {e}")
                     
-                    await send_user_event(ws, channel_id, ls_id, session)
+                    await send_user_event(ws, channel_id, ls_id)
                     last_ue = now
-                    ue_interval = random.randint(45, 65)
                     
                     with self._lock:
                         if slug in self.watching_channels:
                             self.watching_channels[slug]["events_sent"] = self.watching_channels[slug].get("events_sent", 0) + 1
-        finally:
-            if session:
-                try: await session.close()
-                except: pass
+                
+                await asyncio.sleep(1)
     
     def _is_active_hours(self):
         """Check if current time is within active hours (4 AM - 10 AM IST)."""
@@ -3211,15 +2454,13 @@ class DropHunter:
         with self._lock:
             watching = dict(self.watching_channels)
         if not watching:
-            log(f"[DH] WATCH STATUS: Not watching any streamers")
-            return
+            return  # Don't log when idle - poll logs already show "Watching: 0"
         lines = []
         for slug, info in watching.items():
             elapsed = int(time.time() - info.get("started_at", time.time()))
             events = info.get("events_sent", 0)
-            cid = info.get("channel_id", "?")
-            lines.append(f"@{slug} (ID:{cid}) {elapsed//60}m {events}ev")
-        log(f"[DH] WATCHING {len(watching)} streamers: {', '.join(lines)}")
+            lines.append(f"@{slug} {elapsed//60}m {events}ev")
+        log(f"[DH] WATCHING {len(watching)}: {', '.join(lines)}")
     
     def _poll_and_watch(self):
         """Check campaigns, detect drops, send notifications, claim rewards.
@@ -3228,13 +2469,18 @@ class DropHunter:
         with self._lock:
             self.state["polls"] = self.state.get("polls", 0) + 1
             self.state["last_poll"] = datetime.now().isoformat()
-        self._save()
         
-        # Log watching status every minute
+        # Log watching status periodically
+        watching_count = len(self.watching_channels)
         self._log_watching_status()
         
         campaigns, cookie_ok = fetch_campaigns()
-        if not campaigns: return
+        if not campaigns:
+            if cookie_ok is False:
+                log("[DH] Campaigns fetch failed - cookie invalid (401/403)")
+            else:
+                log("[DH] No campaigns found (API empty or blocked)")
+            return
         
         # Safety: ensure campaigns is a list of dicts
         if not isinstance(campaigns, list):
@@ -3263,8 +2509,7 @@ class DropHunter:
                     # Add to known channels
                     self.known_all_channels.add(slug)
                     # AUTO-ADD new drop channels to persistent watchlist
-                    wl = get_watchlist() or []
-                    if slug not in wl:
+                    if slug not in get_watchlist():
                         add_to_watchlist(slug, added_by="auto-drop")
                         log(f"[DH] Auto-added @{slug} to watchlist (new drop channel)")
             
@@ -3465,85 +2710,64 @@ drop_hunter = DropHunter()
 
 def poller():
     """Legacy poller - now just starts DropHunter"""
+    vlog("POLLER", "Starting DropHunter...")
     drop_hunter.start()
+    vlog("POLLER", "DropHunter started. Entering keepalive loop.")
     while True:
         time.sleep(60)
 
 # ---- Main ----
+def _self_ping():
+    """Self-ping every 4 minutes to keep Render free instance alive."""
+    import urllib.request as _req
+    while True:
+        time.sleep(240)  # Every 4 minutes
+        try:
+            url = f"http://127.0.0.1:{DASHBOARD_PORT}/health"
+            _req.urlopen(url, timeout=10)
+            vlog("KEEPALIVE", f"Self-ping OK ({url})")
+        except Exception as e:
+            vlog("KEEPALIVE", f"Self-ping failed: {e}")
+
 def main():
     global COOKIE_VALIDATED
     log("=" * 50)
-    log("KICK STAKE DROPS BOT v28 - SIMPLE WEBSOCKETS + AUTH FIX")
+    log("KICK STAKE DROPS BOT v25 - HEAVY DEBUG MODE")
     log("=" * 50)
-    log(f"tls_client: {'ACTIVE (HTTP bypass)' if HAS_TLS_CLIENT else 'DISABLED'}")
-    log(f"WebSocket: plain websockets (simple & reliable)")
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", DASHBOARD_PORT), DashboardHandler).serve_forever(), daemon=True).start()
-    log(f"Dashboard: port {DASHBOARD_PORT} (user: {DASH_USER})")
+    log(f"Dashboard: port {DASHBOARD_PORT}")
     
     # Self-ping thread: keeps Render free instance alive
-    def _self_ping():
-        import urllib.request as _req
-        while True:
-            time.sleep(240)  # Every 4 minutes
-            try:
-                _req.urlopen(f"http://127.0.0.1:{DASHBOARD_PORT}/health", timeout=10)
-            except: pass
     threading.Thread(target=_self_ping, daemon=True).start()
+    vlog("STARTUP", "Self-ping thread started (every 4 min)")
     
-    # Validate cookie on startup using tls_client
+    # Validate cookie on startup
     cookie = get_cookie()
     if cookie:
-        # Try tls_client first
-        s = get_tls_session()
-        if s:
-            try:
-                s.headers["Cookie"] = f"session={cookie}"
-                s.headers["Authorization"] = f"Bearer {cookie}"
-                s.headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-                resp = s.get("https://kick.com/api/v2/users/me", timeout_seconds=10)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("username"):
-                        COOKIE_VALIDATED = True
-                        log(f"[STARTUP] Cookie VALID - @{data['username']}")
-                    else:
-                        COOKIE_VALIDATED = True
-                        log("[STARTUP] Cookie check - no username but no error")
-                elif resp.status_code == 401:
-                    COOKIE_VALIDATED = False
-                    log("[STARTUP] Cookie EXPIRED! Use /setcookie to update.")
-                else:
-                    COOKIE_VALIDATED = True
-                    log(f"[STARTUP] Cookie check: HTTP {resp.status_code} (not cookie issue)")
-            except Exception as e:
+        try:
+            headers = dict(BASE_HEADERS)
+            headers["Cookie"] = "session=" + cookie
+            headers["Authorization"] = f"Bearer {cookie}"
+            headers["X-Client-Token"] = KICK_CLIENT_TOKEN
+            req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
+            resp = urllib.request.urlopen(req, timeout=10)
+            data = json.loads(resp.read().decode())
+            if data.get("username"):
                 COOKIE_VALIDATED = True
-                log(f"[STARTUP] Cookie check error: {str(e)[:50]} (assuming valid)")
-        else:
-            # Fallback to urllib
-            try:
-                headers = dict(BASE_HEADERS)
-                headers["Cookie"] = "session=" + cookie
-                headers["Authorization"] = f"Bearer {cookie}"
-                headers["X-Client-Token"] = KICK_CLIENT_TOKEN
-                req = urllib.request.Request("https://kick.com/api/v2/users/me", headers=headers)
-                resp = urllib.request.urlopen(req, timeout=10)
-                data = json.loads(resp.read().decode())
-                if data.get("username"):
-                    COOKIE_VALIDATED = True
-                    log(f"[STARTUP] Cookie VALID - @{data['username']}")
-                else:
-                    COOKIE_VALIDATED = True
-                    log("[STARTUP] Cookie check - no username but no error")
-            except urllib.error.HTTPError as e:
-                if e.code == 401:
-                    COOKIE_VALIDATED = False
-                    log("[STARTUP] Cookie EXPIRED! Use /setcookie to update.")
-                else:
-                    COOKIE_VALIDATED = True
-                    log(f"[STARTUP] Cookie check: HTTP {e.code} (not cookie issue)")
-            except Exception as e:
+                log(f"[STARTUP] Cookie VALID - @{data['username']}")
+            else:
                 COOKIE_VALIDATED = True
-                log(f"[STARTUP] Cookie check error: {str(e)[:50]} (assuming valid)")
+                log("[STARTUP] Cookie valid but no username")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                COOKIE_VALIDATED = False
+                log("[STARTUP] Cookie EXPIRED! Use /setcookie to update.")
+            else:
+                COOKIE_VALIDATED = True
+                log(f"[STARTUP] Cookie check HTTP {e.code} (assuming valid)")
+        except Exception as e:
+            COOKIE_VALIDATED = True
+            log(f"[STARTUP] Cookie check error (assuming valid): {str(e)[:50]}")
     else:
         COOKIE_VALIDATED = False
         log("[STARTUP] No cookie found! Use /setcookie to add one.")
@@ -3559,26 +2783,38 @@ def main():
             follow_drop_streamers(campaigns)
     except: pass
     
-    status = "✅ Cookie OK" if COOKIE_VALIDATED else "🔴 Cookie INVALID"
-    tls_status = "✅ Chrome 120" if HAS_TLS_CLIENT else "❌ urllib (detection risk)"
-    tg_send_admin(f"<b>Bot v26 Started!</b>\n\nCookie: {status}\nTLS: {tls_status}\nDrop Hunter: active\nActive Hours: 2 AM - 11 AM IST\nManual: /watchtest works 24/7")
-    log("Listening...")
+    status = "Cookie OK" if COOKIE_VALIDATED else "Cookie INVALID"
+    tg_send_admin(f"<b>Bot v25 Started!</b>\n\nCookie: {status}\nDrop Hunter: active\nActive Hours: 2 AM - 11 AM IST\nManual: /watchtest works 24/7")
+    log("Listening... (24/7 mode - never stops!)")
     offset = 0
     while True:
-        for u in tg_get_updates(offset):
-            offset = u["update_id"] + 1
-            msg = u.get("message", {})
-            cid = msg.get("chat", {}).get("id")
-            text = msg.get("text", "")
-            # Extract Telegram username and name
-            from_user = msg.get("from", {})
-            tg_username = from_user.get("username", "")
-            tg_first_name = from_user.get("first_name", "")
-            if text.startswith("/"):
-                log(f"CMD: {text} from @{tg_username or cid}")
-                handle_command(text.split()[0].lower(), cid, text, username=tg_username, first_name=tg_first_name)
+        try:
+            for u in tg_get_updates(offset):
+                offset = u["update_id"] + 1
+                msg = u.get("message", {})
+                cid = msg.get("chat", {}).get("id")
+                text = msg.get("text", "")
+                # Extract Telegram username and name
+                from_user = msg.get("from", {})
+                tg_username = from_user.get("username", "")
+                tg_first_name = from_user.get("first_name", "")
+                if text.startswith("/"):
+                    log(f"CMD: {text} from @{tg_username or cid}")
+                    handle_command(text.split()[0].lower(), cid, text, username=tg_username, first_name=tg_first_name)
+        except Exception as e:
+            vlog("MAIN", f"Main loop error: {type(e).__name__}: {str(e)[:100]}")
+            log(f"[MAIN] Loop error: {str(e)[:80]} - continuing...")
+            time.sleep(5)  # Wait 5s before retry
         time.sleep(1)
 
 if __name__ == "__main__":
-    try: main()
-    except KeyboardInterrupt: log("Stopped")
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("Stopped by user")
+    except Exception as e:
+        log(f"FATAL: {type(e).__name__}: {str(e)[:200]}")
+        # Try to notify admin before dying
+        try:
+            tg_send_admin(f"<b>🔴 BOT CRASHED!</b>\n{type(e).__name__}: {str(e)[:200]}")
+        except: pass

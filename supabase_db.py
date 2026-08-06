@@ -310,20 +310,16 @@ def add_to_history_db(campaign, event_type="seen"):
         print(f"[DB] add_to_history error: {e}")
         return False
 
-# ==================== LOGS (24-HOUR RETENTION) ====================
+# ==================== LOGS ====================
 def save_logs(logs_data):
-    """Save logs to Supabase.
-    LOG_BUFFER holds ~3000 entries = ~24 hours of data.
-    This function replaces all Supabase logs with buffer contents.
-    """
+    """Save logs to Supabase (batch insert)"""
     def _do():
         client = get_client()
         if not logs_data:
             return True
-        
-        # Delete all existing logs and insert fresh from buffer
+        trimmed = logs_data[-200:] if len(logs_data) > 200 else logs_data
         client.table("logs").delete().neq("id", 0).execute()
-        rows = [{"time": l.get("time", ""), "msg": l.get("msg", "")} for l in logs_data]
+        rows = [{"time": l.get("time", ""), "msg": l.get("msg", "")} for l in trimmed]
         if rows:
             for i in range(0, len(rows), 50):
                 batch = rows[i:i+50]
