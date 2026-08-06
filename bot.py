@@ -207,13 +207,7 @@ import urllib.parse as _urlparse
 
 # Priority: User-specific > ENV var KICK_COOKIE
 def get_cookie(user_id=None):
-    """Get cookie DECODED: user-specific (from /setcookie) > ENV var KICK_COOKIE
-    
-    Simple logic:
-    - If user has set cookie via /setcookie: use THEIR cookie
-    - Otherwise: use admin ENV var KICK_COOKIE
-    No more Supabase global or local file fallback!
-    """
+    """Get cookie DECODED: user-specific > ENV var > Supabase > local file"""
     raw = ""
     
     # 1. User-specific cookie (if user called /setcookie)
@@ -226,10 +220,29 @@ def get_cookie(user_id=None):
         except Exception as e:
             print(f"[DB] get_user_cookie error: {e}")
     
-    # 2. ENV var KICK_COOKIE (fallback - admin cookie)
+    # 2. ENV var KICK_COOKIE (admin cookie)
     if not raw and INITIAL_COOKIE:
         raw = INITIAL_COOKIE
         print(f"[COOKIE] Using ENV var KICK_COOKIE ({len(raw)} chars)")
+    
+    # 3. Supabase global cookie
+    if not raw and USE_SUPABASE:
+        try:
+            c = db.load_cookie_db()
+            if c:
+                raw = c
+                print(f"[COOKIE] Using Supabase global cookie ({len(raw)} chars)")
+        except Exception as e:
+            print(f"[DB] get_cookie fallback: {e}")
+    
+    # 4. Local file
+    if not raw and os.path.exists(COOKIE_FILE):
+        try:
+            with open(COOKIE_FILE) as f:
+                raw = json.load(f).get("cookie", "")
+                if raw:
+                    print(f"[COOKIE] Using local file ({len(raw)} chars)")
+        except: pass
     
     # ALWAYS decode: %7C → | (Kick needs decoded cookie)
     if raw:
@@ -2809,6 +2822,8 @@ class DropHunter:
         self.failed_rewards = set()  # permanently failed - don't re-add to retry queue
         self.known_stake_campaigns = set()  # IDs of confirmed Stake drops only
         self._lock = threading.Lock()
+        # State tracking for dashboard
+        self.state = {"polls": 0, "last_poll": None, "known": {}}
     
     def start(self):
         if self.active: return
