@@ -2069,6 +2069,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         state = load_state()
         known = state.get("known", {})
+        # Get poll count from DropHunter's in-memory state (more accurate)
+        poll_count = drop_hunter.state.get('polls', 0)
+        last_poll = drop_hunter.state.get('last_poll', None)
         subs = load_subs()
         active = sum(1 for s in subs.values() if s.get("active", True))
         rows = ""
@@ -2114,7 +2117,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 <style>body{{font-family:Arial;background:#1a1a2e;color:#eee;padding:20px}}h1{{color:#e94560}}.c{{background:#16213e;padding:20px;border-radius:10px;margin:10px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;text-align:left;border-bottom:1px solid #333}}th{{background:#0f3460}}a{{color:#e94560}}</style></head><body>
 <h1>Kick Stake Drops Bot v25 - Test Mode + Logs</h1>
 <p><a href="/logs">View Logs</a></p>
-<div class="c"><h2>Status</h2><p>Polls: {state.get('polls',0)}</p><p>Last: {state.get('last_poll','never')}</p></div>
+<div class="c"><h2>Status</h2><p>Polls: {poll_count}</p><p>Last: {last_poll[:19] if last_poll else 'never'}</p></div>
 <div class="c"><h2>Drop Hunter v3 (Always-On)</h2><p style='color:{dh_c};font-size:1.2em'><b>{dh_s}</b></p><p>Watching: {dh_watching} channels</p><p>Known: {dh_known} channels</p><p>Claimed: {dh_claimed}</p><p>Pending retries: {dh_retries}</p></div>
 {user_cookies_html}
 <div class="c"><h2>Parallel Watcher</h2><p style='color:{pw_c};font-size:1.2em'><b>{pw_s}</b></p><p>Watching: {w_list}</p><p>Watched: {pw.state.get('total_watched',0)}</p><p>Claimed: {pw.state.get('rewards_claimed',0)}</p></div>
@@ -2277,7 +2280,8 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         for i in range(0, len(msg), 4000): tg_send(msg[i:i+4000], chat_id=chat_id)
 
     elif cmd == "/status":
-        tg_send(f"Polls: {load_state().get('polls',0)}\nDrops: {len(load_state().get('known',{}))}\nSubs: {len(get_active_subs())}\nPW: {'ON' if pw.active else 'OFF'}\nSW: {'ON' if any(sw.active for sw in single_watchers.values()) else 'OFF'}", chat_id=chat_id)
+        polls = drop_hunter.state.get('polls', 0)
+        tg_send(f"Polls: {polls}\nDrops: {len(drop_hunter.known_campaigns)}\nWatching: {len(drop_hunter.watching_channels)}\nSubs: {len(get_active_subs())}\nDH: {'ON' if drop_hunter.active else 'OFF'}\nPW: {'ON' if pw.active else 'OFF'}\nSW: {'ON' if any(sw.active for sw in single_watchers.values()) else 'OFF'}", chat_id=chat_id)
 
     elif cmd == "/setcookie":
         parts = text.split(maxsplit=1)
@@ -2636,9 +2640,9 @@ def handle_command(cmd, chat_id, text="", username=None, first_name=None):
         total_watching = sw_watching + pw_watching + single_watching
         
         # Drop stats
-        known_channels = len(state.get("known", {}))
-        total_polls = state.get("polls", 0)
-        claimed = len(state.get("claimed", {}))
+        known_channels = len(drop_hunter.known_all_channels)
+        total_polls = drop_hunter.state.get("polls", 0)
+        claimed = len(drop_hunter.claimed_rewards)
         history_count = len(history)
         
         # Cookie status
