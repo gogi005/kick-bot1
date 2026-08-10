@@ -1,4 +1,5 @@
-"""Kick Stake Drops Bot v25 - TIME WINDOW + TEST MODE
+"""
+Kick Stake Drops Bot v25 - TIME WINDOW + TEST MODE
 - ACTIVE HOURS: 2 AM to 11 AM IST (auto watch)
 - POLLING: 24/7 every 5 seconds (always detects new drops)
 - MANUAL: /watchtest works 24/7
@@ -9,8 +10,6 @@
 - Notifications to ALL users
 - Auto-add new drop streamers to watchlist
 - Password-protected dashboard + logs page
-- Better Slots discovery (category_id=28 API + keyword fallback)
-- Fixed get_watchlist() None return bug
 """
 import urllib.request, json, time, os, threading, random, hashlib
 import asyncio
@@ -85,7 +84,6 @@ FOLLOWED_API = "https://kick.com/api/v2/channels/followed"
 FOLLOW_COOLDOWN = {}  # username -> timestamp when retry allowed
 CATEGORY_LIVESTREAMS = "https://web.kick.com/api/v1/livestreams?category_id={cat_id}&limit=50&sort=viewer_count_desc"
 CATEGORIES_SEARCH = "https://kick.com/api/v2/categories"
-CATEGORIES_SEARCH_V1 = "https://kick.com/api/v1/categories"
 WS_TOKEN_API = "https://websockets.kick.com/viewer/v1/token"
 WS_URL_TEMPLATE = "wss://websockets.kick.com/viewer/v1/connect?token={token}"
 KICK_CLIENT_TOKEN = os.environ.get("KICK_CLIENT_TOKEN", "e1393935a959b4020a4491574f6490129f678acdaa92760471263db43487f823")
@@ -114,16 +112,11 @@ LOG_BUFFER = []
 LOG_LOCK = threading.Lock()
 MAX_LOG_BUFFER = 500
 _LOG_SAVE_TIMER = 0  # Debounce: only save logs every 30 seconds
-_LOG_FILE_SAVE_TIMER = 0  # JSON file save timer
 
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
-    try:
-        print(line, flush=True)
-    except UnicodeEncodeError:
-        safe = line.encode('ascii', errors='replace').decode('ascii')
-        print(safe, flush=True)
+    print(line, flush=True)
     with LOG_LOCK:
         LOG_BUFFER.append({"time": datetime.now().isoformat(), "msg": msg})
         if len(LOG_BUFFER) > MAX_LOG_BUFFER:
@@ -131,46 +124,34 @@ def log(msg):
     _save_logs()
 
 def _save_logs():
-    global _LOG_SAVE_TIMER, _LOG_FILE_SAVE_TIMER
+    global _LOG_SAVE_TIMER
     try:
         now = time.time()
-        
-        # ALWAYS save to JSON file every 5 seconds (instant dashboard updates)
-        if now - _LOG_FILE_SAVE_TIMER >= 5:
-            _LOG_FILE_SAVE_TIMER = now
-            with LOG_LOCK:
-                logs_data = list(LOG_BUFFER[-300:])  # Keep last 300 for dashboard
-            try:
-                with open(LOG_FILE, "w") as f:
-                    json.dump(logs_data, f)
-            except: pass
-        
-        # Save to Supabase every 30 seconds (24-hour retention)
-        if USE_SUPABASE and now - _LOG_SAVE_TIMER >= 30:
-            _LOG_SAVE_TIMER = now
-            with LOG_LOCK:
-                logs_data = list(LOG_BUFFER)  # Send ALL logs for retention
+        if USE_SUPABASE and now - _LOG_SAVE_TIMER < 30:
+            return  # Debounce: skip if saved recently
+        _LOG_SAVE_TIMER = now
+        with LOG_LOCK:
+            logs_data = list(LOG_BUFFER[-200:])
+        if USE_SUPABASE:
             try:
                 db.save_logs(logs_data)
+                return
             except Exception as e:
                 print(f"[DB] _save_logs fallback: {e}")
+        with open(LOG_FILE, "w") as f:
+            json.dump(logs_data, f)
     except: pass
 
 def load_logs():
-    # PRIORITY: JSON file first (instant), then Supabase (backup)
-    if os.path.exists(LOG_FILE):
-        try:
-            with open(LOG_FILE) as f:
-                data = json.load(f)
-                if data:  # If JSON file has data, use it (fast)
-                    return data
-        except: pass
-    # Fallback to Supabase if JSON file is empty/missing
     if USE_SUPABASE:
         try:
             return db.load_logs()
         except Exception as e:
             print(f"[DB] load_logs fallback: {e}")
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE) as f: return json.load(f)
+        except: pass
     return []
 
 # ---- Cookie ----
@@ -684,125 +665,39 @@ def claim_reward(campaign_id, reward_id, user_id=None):
         return None
 
 def search_slots_category():
-    """Find Slots & Casino category ID using working v1 API.
-    v2/categories is Kasada-blocked, so we use v1/categories instead."""
+    """Find Slots & Casino category ID"""
     global SLOTS_CATEGORY_ID
     if SLOTS_CATEGORY_ID: return SLOTS_CATEGORY_ID
-    
-    # Method 1: Use v1/categories API (works without Kasada)
     try:
-        req = urllib.request.Request(CATEGORIES_SEARCH_V1)
-        for k, v in BASE_HEADERS.items():
-            req.add_header(k, v)
-        resp = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(resp.read().decode())
+        data = kick_request(CATEGORIES_SEARCH)
         categories = data if isinstance(data, list) else data.get("data", [])
         for cat in categories:
             name = cat.get("name", "").lower()
-            if "gambling" in name:  # Gambling = parent of Slots & Casino
+            if "slots" in name or "casino" in name:
                 SLOTS_CATEGORY_ID = cat.get("id")
-                log(f"[CAT] Found Gambling category ID: {SLOTS_CATEGORY_ID}")
+                log(f"[CAT] Slots & Casino category ID: {SLOTS_CATEGORY_ID}")
                 return SLOTS_CATEGORY_ID
-    except Exception as e:
-        log(f"[CAT] v1 categories search error: {e}")
-    
-    # Method 2: Hardcode known Gambling category ID (4)
-    SLOTS_CATEGORY_ID = 4
-    log("[CAT] Using hardcoded Gambling category ID: 4")
-    return SLOTS_CATEGORY_ID
-
-_slots_cache = {"data": [], "ts": 0}
+    except: pass
+    return None
 
 def get_slots_streamers():
-    """Get ALL live streamers from Slots & Casino category.
-    Uses category-specific API (category_id=28) for complete results.
-    Falls back to filter-based approach if category API fails.
-    Caches results for 30 seconds to avoid excessive API calls."""
-    global _slots_cache
-    now = time.time()
-    
-    # Return cached if fresh (< 30 seconds)
-    if _slots_cache["data"] and now - _slots_cache["ts"] < 30:
-        return _slots_cache["data"]
-    
-    result = []
-    total_checked = 0
-    
-    # Method 1: Category-specific API (SLOTS_CATEGORY_ID = 28)
-    # This returns ONLY Slots & Casino streams - all 50+ live!
-    SLOTS_CAT_ID = 28
+    """Get live streamers from Slots & Casino category as fallback"""
+    cat_id = search_slots_category()
+    if not cat_id: return []
     try:
-        url = f"https://web.kick.com/api/v1/livestreams?category_id={SLOTS_CAT_ID}&limit=200&sort=viewer_count_desc"
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", BASE_HEADERS["User-Agent"])
-        req.add_header("Accept", "application/json")
-        resp = urllib.request.urlopen(req, timeout=15)
-        data = json.loads(resp.read().decode())
-        livestreams = data.get("data", {}).get("livestreams", [])
-        total_checked = len(livestreams)
-        
-        for s in livestreams:
-            channel = s.get("channel", {})
-            username = channel.get("username", "")
-            channel_id = channel.get("id")
-            livestream_id = s.get("id")
-            cat = s.get("category", {})
-            
+        data = kick_request(CATEGORY_LIVESTREAMS.format(cat_id=cat_id))
+        streams = data.get("data", []) if isinstance(data, dict) else data
+        result = []
+        for s in streams:
+            user = s.get("broadcaster_user", {}) if "broadcaster_user" in s else s.get("channel", {})
+            username = user.get("username", "") or s.get("slug", "")
+            channel_id = user.get("id") or s.get("channel_id")
+            livestream_id = s.get("id") or s.get("livestream_id")
             if username and channel_id:
-                result.append({
-                    "username": username,
-                    "channel_id": channel_id,
-                    "livestream_id": livestream_id,
-                    "category": cat.get("name", "Slots & Casino"),
-                    "viewers": s.get("viewer_count", 0)
-                })
-        
-        if result:
-            _slots_cache = {"data": result, "ts": now}
-            log(f"[CAT] Found {len(result)} Slots & Casino streamers (cat_id={SLOTS_CAT_ID}) from {total_checked} live")
-            return result
-    except Exception as e:
-        log(f"[CAT] Category API error: {e}")
-    
-    # Method 2: Fallback - fetch all live and filter by gambling keywords
-    try:
-        url = "https://web.kick.com/api/v1/livestreams?limit=200&sort=viewer_count_desc"
-        req = urllib.request.Request(url)
-        req.add_header("User-Agent", BASE_HEADERS["User-Agent"])
-        req.add_header("Accept", "application/json")
-        resp = urllib.request.urlopen(req, timeout=15)
-        data = json.loads(resp.read().decode())
-        livestreams = data.get("data", {}).get("livestreams", [])
-        total_checked = len(livestreams)
-        
-        GAMBLING_KEYWORDS = ["slot", "casino", "poker", "blackjack", "roulette", "baccarat", "gambling", "craps", "bingo"]
-        
-        for s in livestreams:
-            cat = s.get("category", {})
-            cat_name = cat.get("name", "").lower()
-            cat_slug = cat.get("slug", "").lower()
-            
-            if any(kw in cat_name or kw in cat_slug for kw in GAMBLING_KEYWORDS):
-                channel = s.get("channel", {})
-                username = channel.get("username", "")
-                channel_id = channel.get("id")
-                livestream_id = s.get("id")
-                
-                if username and channel_id:
-                    result.append({
-                        "username": username,
-                        "channel_id": channel_id,
-                        "livestream_id": livestream_id,
-                        "category": cat.get("name", "?"),
-                        "viewers": s.get("viewer_count", 0)
-                    })
-        
-        _slots_cache = {"data": result, "ts": now}
-        log(f"[CAT] Fallback: Found {len(result)} Gambling streamers from {total_checked} total live")
+                result.append({"username": username, "channel_id": channel_id, "livestream_id": livestream_id})
+        log(f"[CAT] Found {len(result)} Slots & Casino streamers")
         return result
-    except Exception as e:
-        log(f"[CAT] Fallback error: {e}")
-        return _slots_cache.get("data", [])
+    except: return []
 
 def smart_claim_check(username=None):
     """Smart claim check - progress is RATIO (0-1), not seconds"""
@@ -1050,22 +945,21 @@ def remove_from_watchlist(username):
 _watchlist_local_cache = set()
 
 def get_watchlist():
-    """Get all channels in the watchlist. ALWAYS returns a list."""
+    """Get all channels in the watchlist."""
     global _watchlist_local_cache
     if _watchlist_local_cache:
         return list(_watchlist_local_cache)
     if USE_SUPABASE:
         try:
             result = db.get_watchlist_db()
-            if result:
-                _watchlist_local_cache = set(result)
-                return result
+            _watchlist_local_cache = set(result) if result else set()
+            return result
         except Exception as e:
             print(f"[DB] get_watchlist fallback: {e}")
     watchlist = load_watchlist()
-    result = watchlist.get("channels", []) if isinstance(watchlist, dict) else []
+    result = watchlist.get("channels", [])
     _watchlist_local_cache = set(result)
-    return result or []
+    return result
 
 def follow_drop_streamers(campaigns):
     """Follow all streamers from active Stake drops"""
@@ -1289,7 +1183,8 @@ class SingleStreamWatcher:
                         self.events_sent += 1
                         self.watch_time += 60
                     last_ue = now
-                    # Claim check REMOVED - DropHunter handles claims when new drops detected
+                    if elapsed_since_start >= 60:
+                        smart_claim_check(username)
                     log(f"[WATCH] event #{self.events_sent} @{username} ({fmt_duration(self.watch_time)})")
                 if now - last_refresh >= 300:
                     last_refresh = now
@@ -2236,46 +2131,18 @@ class DropHunter:
                     except Exception as e:
                         log(f"[DH] Progress check error: {str(e)[:50]}")
                     
-                    # STEP 2: If progress API blocked (Kasada 403), try fresh check
-                    # then claim directly after enough watch time (90s+)
+                    # STEP 2: If progress API blocked (Kasada 403), try claiming directly
+                    # after enough watch time (90s+). Stake drops need ~2 min watch.
                     if not progress_ok and elapsed >= 90:
-                        # Fresh progress check (bypass cache) before blind claim
-                        fresh_check_done = False
-                        try:
-                            _progress_cache["data"] = None  # Force fresh fetch
-                            fresh = fetch_progress()
-                            if fresh:
-                                for fp in fresh:
-                                    fpid = str(fp.get("id", "")) or str(fp.get("campaign_id", ""))
-                                    if fpid == str(campaign_id):
-                                        for fr in fp.get("rewards", []):
-                                            frid = str(fr.get("id", "")) or str(fr.get("reward_id", ""))
-                                            if frid == str(reward_id):
-                                                fratio = fr.get("progress", 0)
-                                                if fr.get("claimed"):
-                                                    log(f"[DH] Already claimed (fresh check): {name}")
-                                                    with self._lock: self.claim_retry_queue.pop(key, None)
-                                                    fresh_check_done = True
-                                                    break
-                                                if fratio < 1.0:
-                                                    log(f"[DH] Not ready (fresh ratio={fratio:.2f}): {name} - skip claim")
-                                                    fresh_check_done = True
-                                                    break
-                                                # ratio >= 1.0 - proceed to claim
-                                                fresh_check_done = True
-                                                break
-                        except: pass
-                        
-                        if not fresh_check_done:
-                            log(f"[DH] Attempting claim (no progress data, {elapsed}s elapsed): {name}")
-                            result = claim_reward(campaign_id, reward_id)
-                            if result:
-                                with self._lock:
-                                    self.claimed_rewards.add(key)
-                                    self.claim_retry_queue.pop(key, None)
-                                log(f"[DH] ✅ CLAIMED! {name} - {reward_name}")
-                                tg_send(f"<b>🎉 CLAIMED!</b>\n@{slug}\n{name}\n{reward_name}")
-                                continue
+                        log(f"[DH] Attempting claim (no progress data, {elapsed}s elapsed): {name}")
+                        result = claim_reward(campaign_id, reward_id)
+                        if result:
+                            with self._lock:
+                                self.claimed_rewards.add(key)
+                                self.claim_retry_queue.pop(key, None)
+                            log(f"[DH] ✅ CLAIMED! {name} - {reward_name}")
+                            tg_send(f"<b>🎉 CLAIMED!</b>\n@{slug}\n{name}\n{reward_name}")
+                            continue
                     
                     # Update retry counters
                     if key in self.claim_retry_queue and key not in self.claimed_rewards:
